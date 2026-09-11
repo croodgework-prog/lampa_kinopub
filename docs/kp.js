@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.74';
+  var PLUGIN_VERSION  = '1.0.75';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -1576,18 +1576,74 @@
    * so we avoid both: "Русские 01", "Английские 04", "ENG 04 (forced)".
    * The number is kinopub's own rendition number (matches the website).
    */
-  function kpSubLabel(h, i) {
-    var lang = String(h.lang || '').toLowerCase();
+  function kpSubLabels(list) {
     var isRu = false;
     try { isRu = (Lampa.Storage.get('language', 'ru') === 'ru'); } catch (e) {}
-    var base = (isRu && KP_LANG_RU[lang]) ? KP_LANG_RU[lang] : (lang ? lang.toUpperCase() : 'SUB');
-    var num = '';
-    var m = String(h.name || '').match(/#\s*(\d+)/);
-    if (m) num = m[1];
-    else num = ((i + 1) < 10 ? '0' : '') + (i + 1);
-    var label = base + ' ' + num;
-    if (h.forced) label += ' (forced)';
-    return label;
+    var perLang = {};
+    var i;
+    for (i = 0; i < list.length; i++) {
+      var lg = String(list[i].lang || '').toLowerCase();
+      perLang[lg] = (perLang[lg] || 0) + 1;
+    }
+    var counter = {};
+    var out = [];
+    for (i = 0; i < list.length; i++) {
+      var h = list[i];
+      var lang = String(h.lang || '').toLowerCase();
+      var base = (isRu && KP_LANG_RU[lang]) ? KP_LANG_RU[lang] : (lang ? lang.toUpperCase() : 'SUB');
+      var m = String(h.name || '').match(/#\s*(\d+)/);
+      var label;
+      if (m) {
+        // HLS rendition names carry kinopub's own number ("RUS #01")
+        label = base + ' ' + m[1];
+      } else {
+        counter[lang] = (counter[lang] || 0) + 1;
+        label = base + (perLang[lang] > 1 ? ' ' + counter[lang] : '');
+      }
+      if (h.forced) label += ' (forced)';
+      out.push(label);
+    }
+    return out;
+  }
+
+  // Single-entry convenience (kept for the 'native' mode name push).
+  function kpSubLabel(h, i) {
+    return kpSubLabels([h])[0];
+  }
+
+  /**
+   * /v1/items/media-links?mid=<id> → subtitles[] ({lang, forced, embed, file,
+   * url}) → the same shape kpExtractHlsSubs() produces. `url` is a direct
+   * .srt on the kinopub CDN (msk-static-NN.cdntogo.net for loc=ru), which
+   * the plugin's renderer reads as plain text — no HLS parsing needed.
+   */
+  function kpMediaLinksToList(subs) {
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < (subs || []).length; i++) {
+      var s = subs[i];
+      if (!s || !s.url) continue;
+      if (seen[s.url]) continue;
+      seen[s.url] = true;
+      out.push({ name: '', lang: s.lang || '', uri: s.url, forced: !!s.forced, embed: !!s.embed, order: out.length });
+    }
+    return kpSortSubs(out);
+  }
+
+  // Stable sort: rus → eng → ukr → everything else in kinopub's order, so a
+  // 60-entry list starts with the languages the user is most likely to want.
+  var KP_LANG_PRIORITY = { rus: 0, eng: 1, ukr: 2 };
+  function kpSortSubs(list) {
+    var decorated = [];
+    for (var i = 0; i < list.length; i++) {
+      var lg = String(list[i].lang || '').toLowerCase();
+      var pr = (typeof KP_LANG_PRIORITY[lg] === 'number') ? KP_LANG_PRIORITY[lg] : 9;
+      decorated.push({ pr: pr, i: i, v: list[i] });
+    }
+    decorated.sort(function (a, b) { return (a.pr - b.pr) || (a.i - b.i); });
+    var out = [];
+    for (var k = 0; k < decorated.length; k++) { decorated[k].v.order = k; out.push(decorated[k].v); }
+    return out;
   }
 
   /* ── Renderer: fetch rendition playlist → WebVTT segments → cues → DOM ── */
@@ -1902,8 +1958,9 @@
       });
       items.push(item);
     }
+    var labels = kpSubLabels(hlsList);
     for (var i = 0; i < hlsList.length; i++) {
-      add(kpSubLabel(hlsList[i], i), { uri: hlsList[i].uri, hls: true });
+      add(labels[i], { uri: hlsList[i].uri, hls: !!hlsList[i].name });
     }
     if (!hlsList.length) {
       for (var j = 0; j < apiList.length; j++) {
@@ -2035,61 +2092,85 @@
     var mode = kpSubsModeResolved();
     var gen  = kpSubsAttachGen;
     var master = data._kp.subsMaster || data._kp.master;
+    var api    = data._kp.apiSubs || [];
     kpDiagNote('subs_mode', mode + ' (setting ' + kpSubsMode() + ')');
     if (mode === 'off') return;
     if (mode === 'api') { kpDiagNote('subs_api', 'play.subtitles=' + ((data.subtitles && data.subtitles.length) || 0)); return; }
-    if (!master) { kpDiagNote('subs', 'no master url'); return; }
 
-    kpFetchMaster(master, function (err, body, status) {
-      if (gen !== kpSubsAttachGen) return; // player moved to another item
-      var hls = [];
-      if (err) {
-        Logger.warn('subs', 'master fetch failed', { err: err, status: status, host: kpUrlHost(master) });
-        kpDiagNote('subs_master_error', err + ' status=' + status + ' host=' + kpUrlHost(master));
-      } else {
-        var ex = kpExtractHlsSubs(master, body);
-        hls = ex.list;
-        kpDiag.last.hlsSubs = hls.map(function (h, i) { return kpSubLabel(h, i); });
-        Logger.info('subs', 'master parsed', {
-          host: kpUrlHost(master), bytes: body.length,
-          subtitleRenditions: hls.length, audioRenditions: ex.audioRenditions, streamInfs: ex.streamInfs,
-          names: hls.map(function (h) { return h.name; }),
-          sampleUri: hls[0] ? hls[0].uri : null
-        });
-        kpDiagNote('subs_master', 'renditions=' + hls.length + ' audio=' + ex.audioRenditions + ' bytes=' + body.length);
-      }
-      var api = data._kp.apiSubs || [];
+    function finish(list, source) {
+      if (gen !== kpSubsAttachGen) return;
       if (kpDiagOn()) {
-        try { Lampa.Noty.show('KP субтитры: API ' + api.length + ' · HLS ' + hls.length + ' · режим ' + mode); } catch (e) {}
-        // Variant D check: does /v1/items/media-links list more subtitles
-        // than the item payload? Logged only, never used for playback.
-        if (data._kp.mediaId) {
-          try {
-            KP.mediaLinks(new Lampa.Reguest(), data._kp.mediaId, function (j) {
-              var subs = (j && j.subtitles) || [];
-              kpDiagNote('api_media_links', 'subtitles=' + subs.length + (subs.length ? ' → ' + subs.map(function (s) { return (s.lang || '?') + (s.forced ? '/forced' : '') + (s.embed ? '/embed' : ''); }).join(',') : ''));
-              Logger.info('subs', 'media-links', { mid: data._kp.mediaId, subtitles: subs.map(function (s) { return { lang: s.lang, embed: s.embed, forced: s.forced, file: s.file, host: kpUrlHost(s.url) }; }) });
-            }, function (xhr, status) {
-              kpDiagNote('api_media_links', 'error http=' + (xhr && xhr.status) + ' ' + status);
-            });
-          } catch (e) {}
-        }
+        try { Lampa.Noty.show('KP субтитры: ' + list.length + ' (' + source + ') · item API ' + api.length + ' · режим ' + mode); } catch (e) {}
       }
       if (mode === 'native') {
         // AVPlay (via proxy subs=1) lists the TEXT tracks itself; we only
         // supply readable names — Lampa maps translates.subs[track_num].
         try {
           if (Lampa.PlayerPanel && typeof Lampa.PlayerPanel.updateTranslate === 'function') {
-            Lampa.PlayerPanel.updateTranslate('subs', hls.map(function (h, i) { return { label: kpSubLabel(h, i) }; }));
+            var names = kpSubLabels(list);
+            Lampa.PlayerPanel.updateTranslate('subs', names.map(function (n) { return { label: n }; }));
           }
         } catch (e) {}
-        kpDiagNote('subs_native', 'names pushed=' + hls.length);
+        kpDiagNote('subs_native', 'names pushed=' + list.length);
         return;
       }
-      var items = kpBuildSubItems(hls, api);
-      if (!items.length) { kpDiagNote('subs_list', 'empty (no HLS renditions, no API subs)'); return; }
-      kpDiagNote('subs_list', items.length + ' tracks (' + (hls.length ? 'hls' : 'api') + ')');
+      var items = kpBuildSubItems(list, api);
+      if (!items.length) { kpDiagNote('subs_list', 'empty (no ' + source + ', no item subs)'); return; }
+      kpDiagNote('subs_list', items.length + ' tracks (' + (list.length ? source : 'item api') + ')');
       kpInstallSubItems(items, data);
+    }
+
+    // Step 2 — HLS4 master renditions (needs the master to be reachable from
+    // the TV; from RU networks api.service-kp.com/manifest often times out).
+    function viaMaster(reason) {
+      if (!master) { kpDiagNote('subs', 'no master url'); finish([], 'no master'); return; }
+      kpFetchMaster(master, function (err, body, status) {
+        if (gen !== kpSubsAttachGen) return;
+        var hls = [];
+        if (err) {
+          Logger.warn('subs', 'master fetch failed', { err: err, status: status, host: kpUrlHost(master) });
+          kpDiagNote('subs_master_error', err + ' status=' + status + ' host=' + kpUrlHost(master));
+        } else {
+          var ex = kpExtractHlsSubs(master, body);
+          hls = ex.list;
+          kpDiag.last.hlsSubs = kpSubLabels(hls);
+          Logger.info('subs', 'master parsed', {
+            host: kpUrlHost(master), bytes: body.length,
+            subtitleRenditions: hls.length, audioRenditions: ex.audioRenditions, streamInfs: ex.streamInfs,
+            names: hls.map(function (h) { return h.name; }),
+            sampleUri: hls[0] ? hls[0].uri : null
+          });
+          kpDiagNote('subs_master', 'renditions=' + hls.length + ' audio=' + ex.audioRenditions + ' bytes=' + body.length + (reason ? ' (' + reason + ')' : ''));
+        }
+        finish(hls, 'hls');
+      });
+    }
+
+    if (mode === 'hls' || mode === 'native') { viaMaster(''); return; }
+
+    // Step 1 (auto) — /v1/items/media-links: full subtitle list as direct
+    // .srt files. Works from RU networks where the master does not, and needs
+    // no HLS parsing. Falls back to the master on error / empty list.
+    var mid = data._kp.mediaId;
+    if (!mid || !KP.hasToken()) { kpDiagNote('subs_media_links', 'skipped (' + (mid ? 'no token' : 'no media id') + ')'); viaMaster('no media-links'); return; }
+    var t0 = Date.now();
+    KP.mediaLinks(new Lampa.Reguest(), mid, function (j) {
+      if (gen !== kpSubsAttachGen) return;
+      var subs = (j && j.subtitles) || [];
+      var list = kpMediaLinksToList(subs);
+      kpDiag.last.hlsSubs = kpSubLabels(list);
+      Logger.info('subs', 'media-links', {
+        mid: mid, ms: Date.now() - t0, subtitles: subs.length, unique: list.length,
+        langs: list.map(function (x) { return x.lang + (x.forced ? '/f' : ''); }).join(','),
+        host: list[0] ? kpUrlHost(list[0].uri) : ''
+      });
+      kpDiagNote('subs_media_links', 'subtitles=' + list.length + ' ms=' + (Date.now() - t0) + (list[0] ? ' host=' + kpUrlHost(list[0].uri) : ''));
+      if (list.length) finish(list, 'media-links');
+      else viaMaster('media-links empty');
+    }, function (xhr, status) {
+      if (gen !== kpSubsAttachGen) return;
+      kpDiagNote('subs_media_links', 'error http=' + (xhr && xhr.status) + ' ' + status);
+      viaMaster('media-links error');
     });
   }
 
@@ -4979,12 +5060,12 @@
         ua: 'Субтитри'
       },
       kp_set_subs_mode_descr: {
-        ru: 'Откуда брать список субтитров. Авто = все дорожки из HLS-манифеста kinopub (как на сайте), отрисовка плагином — работает на Samsung/LG/браузере. Через плеер ТВ = дорожки остаются в манифесте, их показывает сам плеер (нужен manifest-proxy 1.2+). Только API = старое поведение (2-3 внешних .srt).',
+        ru: 'Откуда брать список субтитров. Авто = полный список kinopub (media-links API, прямые .srt; если недоступно — HLS-манифест), отрисовка плагином. Только из HLS-манифеста = разбор мастера на ТВ (из РФ мастер часто недоступен). Через плеер ТВ = дорожки остаются в манифесте (нужен manifest-proxy 1.2+). Только API = старое поведение (2-3 .srt из карточки).',
         en: 'Where the subtitle list comes from. Auto = every rendition from the kinopub HLS manifest (same as the website), drawn by the plugin. Via TV player = renditions stay in the manifest and the TV player lists them (needs manifest-proxy 1.2+). API only = legacy behaviour (2-3 external .srt).',
         ua: 'Звідки брати список субтитрів. Авто = усі доріжки з HLS-маніфесту kinopub, малює плагін. Через плеєр ТВ = доріжки лишаються у маніфесті (потрібен manifest-proxy 1.2+). Лише API = стара поведінка.'
       },
-      kp_subs_mode_auto:   { ru: 'Авто (все из HLS, рендер плагина)', en: 'Auto (all from HLS, plugin render)', ua: 'Авто (усі з HLS)' },
-      kp_subs_mode_hls:    { ru: 'Все из HLS (рендер плагина)',        en: 'All from HLS (plugin render)',        ua: 'Усі з HLS (плагін)' },
+      kp_subs_mode_auto:   { ru: 'Авто (все дорожки kinopub, рендер плагина)', en: 'Auto (all kinopub tracks, plugin render)', ua: 'Авто (усі доріжки kinopub)' },
+      kp_subs_mode_hls:    { ru: 'Только из HLS-манифеста',            en: 'HLS manifest only',                   ua: 'Лише з HLS-маніфесту' },
       kp_subs_mode_native: { ru: 'Через плеер ТВ (proxy 1.2+)',        en: 'Via TV player (proxy 1.2+)',          ua: 'Через плеєр ТВ (proxy 1.2+)' },
       kp_subs_mode_api:    { ru: 'Только API kinopub (старое)',        en: 'kinopub API only (legacy)',           ua: 'Лише API kinopub' },
       kp_subs_mode_off:    { ru: 'Выключены',                          en: 'Off',                                 ua: 'Вимкнено' },

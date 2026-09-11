@@ -57,7 +57,7 @@ let src = fs.readFileSync(path.join(__dirname, 'docs', 'kp.js'), 'utf8');
 const tail = '  startPlugin();\n\n})();';
 assert(src.endsWith(tail + '\n') || src.endsWith(tail), 'kp.js tail changed — update subs-test.js');
 src = src.replace(tail,
-  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpBuildSubItems, kpSubsModeResolved };\n})();');
+  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpSubLabels, kpMediaLinksToList, kpSortSubs, kpBuildSubItems, kpSubsModeResolved };\n})();');
 new Function(src)();
 const T = global.__kpTest;
 assert(T, 'plugin did not boot (early return?)');
@@ -138,6 +138,25 @@ storage.kp_subs_mode = 'native';
 ok(T.kpSubsModeResolved() === 'hls', 'native without proxy 1.2 falls back to hls');
 storage.kp_subs_mode = 'api';
 ok(T.kpSubsModeResolved() === 'api', 'api mode kept');
+
+// ── 7b. media-links mapping (the RU-network path) ────────────────────────
+const ml = [
+  { lang: 'rus', forced: true,  embed: false, file: '/b/a2/1.srt', url: 'https://h1.msk-static-05.cdntogo.net/pd/T/subtitles/b/a2/1.srt' },
+  { lang: 'ara', forced: false, embed: false, file: '/9/af/2.srt', url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/9/af/2.srt' },
+  { lang: 'spa', forced: false, embed: false, file: '/a/3.srt',    url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/a/3.srt' },
+  { lang: 'spa', forced: false, embed: false, file: '/a/4.srt',    url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/a/4.srt' },
+  { lang: 'rus', forced: false, embed: false, file: '/a/5.srt',    url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/a/5.srt' },
+  { lang: 'eng', forced: false, embed: false, file: '/a/6.srt',    url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/a/6.srt' },
+  { lang: 'eng', forced: false, embed: false, file: '/a/6.srt',    url: 'https://h1.msk-static-06.cdntogo.net/pd/T/subtitles/a/6.srt' },
+  { lang: 'nor', forced: false, embed: false, url: '' }
+];
+const mlist = T.kpMediaLinksToList(ml);
+ok(mlist.length === 6, 'media-links: dedupe by url + drop empty url, got ' + mlist.length);
+ok(mlist.map(x => x.lang).join(',') === 'rus,rus,eng,ara,spa,spa', 'priority sort rus,eng first then kinopub order: ' + mlist.map(x => x.lang).join(','));
+const mlabels = T.kpSubLabels(mlist);
+ok(mlabels.join('|') === 'Русские 1 (forced)|Русские 2|Английские|Арабские|Испанские 1|Испанские 2', 'media-links labels: ' + mlabels.join('|'));
+const mitems = T.kpBuildSubItems(mlist, []);
+ok(mitems.length === 6 && mitems[0].kp_src.uri.indexOf('.srt') > 0 && mitems[0].kp_src.hls === false, 'items from media-links carry direct .srt urls');
 
 // ── 8. Proxy: subs pass-through ───────────────────────────────────────────
 let psrc = fs.readFileSync(path.join(__dirname, 'proxy-server', 'server.js'), 'utf8');
