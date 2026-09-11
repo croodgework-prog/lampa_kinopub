@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.76';
+  var PLUGIN_VERSION  = '1.0.77';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -3482,9 +3482,21 @@
      */
     // 'http' is intentionally excluded — kinopub's progressive MP4 freezes on
     // every Tizen player tested. Falling back to it makes things worse, not better.
-    var FALLBACK_CHAIN = ['hls4', 'hls2', 'hls'];
+    // v1.0.77: `hls` (v1) is the only format whose master lives directly on
+    // the kinopub CDN (msk-static-NN.cdntogo.net for loc=ru); hls2/hls4
+    // masters are served by api.service-kp.com/manifest/, which from RU
+    // networks routinely times out. So after the proxy, try `hls` first.
+    var FALLBACK_CHAIN = ['hls', 'hls2', 'hls4'];
 
-    function nextFallbackUrl(element, triedSet) {
+    // kinopub `hls` (v1) masters are per-voice: ".../master-v1a1.m3u8". Lampac
+    // selects the voice by rewriting a1 → a<audio.index>; we do the same so a
+    // fallback keeps the chosen dub instead of dropping to the default one.
+    function hlsUrlForVoice(url, voiceOneBased) {
+      if (!url || !(voiceOneBased > 1)) return url;
+      return String(url).replace(/a1\.m3u8(\?|$)/, 'a' + voiceOneBased + '.m3u8$1');
+    }
+
+    function nextFallbackUrl(element, triedSet, voiceOneBased) {
       // pick best file <= maxQ
       var maxQ = maxQuality();
       var avail = (element.kp.files || []).filter(function (f) { return f.quality <= maxQ; });
@@ -3494,6 +3506,7 @@
       for (var i = 0; i < FALLBACK_CHAIN.length; i++) {
         var fmt = FALLBACK_CHAIN[i];
         var url = best.urls && best.urls[fmt];
+        if (url && fmt === 'hls') url = hlsUrlForVoice(url, voiceOneBased);
         if (url && !triedSet[url]) return { url: url, fmt: fmt, q: best.quality };
       }
       return null;
@@ -3677,8 +3690,26 @@
       // makes the player retry with the new URL. We walk the format chain.
       var tried = {};
       tried[stream.url] = true;
+      // v1.0.77: kinopub audio.index (1-based) of the chosen voice — used to
+      // keep the voice on the `hls` fallback (see hlsUrlForVoice).
+      var fallbackVoice = (voiceIdx >= 0 && audios[voiceIdx] && typeof audios[voiceIdx].index === 'number' && audios[voiceIdx].index > 0)
+                          ? audios[voiceIdx].index : (voiceIdx >= 0 ? voiceIdx + 1 : 1);
+      // v1.0.77: Lampa's hls.js gives a manifest 10 s by default; the proxy
+      // (Cloudflare → VPS → kinopub) occasionally needs more from RU networks.
+      play.hls_manifest_timeout = 25000;
+      play.hls_retry_timeout    = 30000;
       play.error = function (work, cb) {
-        var nxt = nextFallbackUrl(element, tried);
+        // First: one retry of the proxy URL. In TV logs the proxy timed out
+        // once at launch and answered instantly 20 s later — a transient.
+        var pu = play._kp && play._kp.proxyUrl;
+        if (pu && !tried[pu + '#retry']) {
+          tried[pu + '#retry'] = true;
+          var retryUrl = pu + (pu.indexOf('?') >= 0 ? '&' : '?') + 'retry=1';
+          Logger.warn('player', 'proxy manifest failed, retrying once', { url: retryUrl.slice(0, 100) });
+          if (cb) cb(retryUrl);
+          return;
+        }
+        var nxt = nextFallbackUrl(element, tried, fallbackVoice);
         if (!nxt) {
           Logger.warn('player', 'no fallback URLs left', { tried: Object.keys(tried).length });
           if (cb) cb(false);
@@ -3787,6 +3818,7 @@
             var proxyUrl = proxyUrlFor(originalUrl, voiceOneBased);
             delete play.quality;
             play.url = proxyUrl;
+            if (play._kp) play._kp.proxyUrl = proxyUrl;
             Logger.info('proxy', 'launching via manifest-proxy', {
               voice: voiceOneBased,
               proxyHost: KP_PROXY_URL,
@@ -3833,6 +3865,7 @@
                 if (pleProxyUrl) {
                   delete ple.quality;
                   ple.url = pleProxyUrl;
+                  if (ple._kp) ple._kp.proxyUrl = pleProxyUrl;
                 }
               }
               Logger.debug('proxy', 'playlist wrapped', { count: playlist.length, voice: voiceOneBased });
