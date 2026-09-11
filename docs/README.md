@@ -7,7 +7,7 @@
 Прямая ссылка плагина:
 
 ```
-https://mainsync-afk.github.io/lampa_kinopub/kp.js
+https://croodgework-prog.github.io/lampa_kinopub/kp.js
 ```
 
 В Lampa: Настройки → Расширения → Добавить плагин → вставить URL → Сохранить.

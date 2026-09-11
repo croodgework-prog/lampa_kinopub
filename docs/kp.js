@@ -2,8 +2,8 @@
  * kp.js — kinopub source plugin for Lampa
  *
  * Author: mainsync-afk
- * Repo:   https://github.com/mainsync-afk/lampa_kinopub
- * URL:    https://mainsync-afk.github.io/lampa_kinopub/kp.js
+ * Repo:   https://github.com/croodgework-prog/lampa_kinopub (fork of mainsync-afk/lampa_kinopub)
+ * URL:    https://croodgework-prog.github.io/lampa_kinopub/kp.js
  *
  * Targets: Samsung Tizen (primary), webOS, Android, browser.
  * Plays through Lampa's built-in HTML5 player and Tizen AVPlayer.
