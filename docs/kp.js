@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.77';
+  var PLUGIN_VERSION  = '1.0.78';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -107,6 +107,9 @@
   //   off    → no subtitles at all
   var KEY_SUBS_MODE   = 'kp_subs_mode';
   var KEY_DIAG        = 'kp_diag';
+  // v1.0.78: dual subtitles — second (learning) language and its position
+  var KEY_SUBS_SECOND     = 'kp_subs_second';      // off | eng | rus | ukr
+  var KEY_SUBS_SECOND_POS = 'kp_subs_second_pos';  // top | bottom
 
   /* ============================================================ *
    *  LOGGER                                                      *
@@ -1648,21 +1651,23 @@
   /* ── Renderer: fetch rendition playlist → WebVTT segments → cues → DOM ── */
 
   var KpSubs = (function () {
-    var active   = null;   // current item (see kpBuildSubItems)
-    var cues     = [];     // {s, e, t} sorted by s
-    var seq      = 0;      // load generation — bumps on every select/reset
-    var lastText = null;
-    var lastIdx  = 0;
+    // Two independent tracks: `main` is what the user picks in the player
+    // menu, `second` is the optional learning track (KEY_SUBS_SECOND) —
+    // both drawn in one Lampa subtitle box (v1.0.78 dual subtitles).
+    function newSlot(name) { return { name: name, item: null, cues: [], seq: 0, lastIdx: 0, text: '' }; }
+    var main     = newSlot('main');
+    var second   = newSlot('second');
+    var lastHtml = null;
 
     function inner() { return $('.player-video__subtitles > div'); }
 
-    function draw(text) {
-      if (text === lastText) return;
-      lastText = text;
+    function draw(html) {
+      if (html === lastHtml) return;
+      lastHtml = html;
       var el = inner();
       if (!el.length) return;
-      el.html(text ? text : '&nbsp;').css({ display: text ? 'inline-block' : 'none' });
-      if (text) {
+      el.html(html ? html : '&nbsp;').css({ display: html ? 'inline-block' : 'none' });
+      if (html) {
         try {
           var box = $('.player-video__subtitles');
           if (box.hasClass('hide')) Lampa.PlayerVideo.subsview(true);
@@ -1670,7 +1675,6 @@
       }
     }
 
-    // "hh:mm:ss.mmm" | "mm:ss.mmm" | srt comma variant → seconds
     function parseTime(s) {
       var m = String(s || '').replace(/^\s+|\s+$/g, '').match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})$/);
       if (!m) return NaN;
@@ -1770,8 +1774,9 @@
       return segs;
     }
 
-    function merge(list) {
+    function merge(slot, list) {
       if (!list.length) return;
+      var cues = slot.cues;
       var seen = {};
       for (var i = 0; i < cues.length; i++) seen[cues[i].s + '|' + cues[i].e + '|' + cues[i].t] = 1;
       for (var k = 0; k < list.length; k++) {
@@ -1781,14 +1786,14 @@
         cues.push(list[k]);
       }
       cues.sort(function (a, b) { return a.s - b.s; });
-      lastIdx = 0;
+      slot.lastIdx = 0;
     }
 
     function currentTime() {
       try { return Lampa.PlayerVideo.video().currentTime || 0; } catch (e) { return 0; }
     }
 
-    function loadSegments(segs, gen, src) {
+    function loadSegments(slot, segs, gen, src) {
       var cur = currentTime();
       var startIdx = 0;
       for (var i = 0; i < segs.length; i++) if (segs[i].start <= cur) startIdx = i;
@@ -1806,29 +1811,29 @@
             var seg = segs[si];
             kpFetchText(seg.url, 10000, function (err, body, status) {
               running--;
-              if (gen !== seq) return;
+              if (gen !== slot.seq) return;
               doneCount++;
               if (err) {
                 failed++;
-                if (failed <= 3) Logger.warn('subs', 'segment fetch failed', { err: err, status: status, url: seg.url });
+                if (failed <= 3) Logger.warn('subs', 'segment fetch failed', { slot: slot.name, err: err, status: status, url: seg.url });
               } else {
                 var r = parseCues(body, seg);
                 if (!logged) {
                   logged = true;
                   Logger.info('subs', 'first segment parsed', {
-                    idx: si, cues: r.cues.length, strategy: r.strategy, offset: r.offset,
+                    slot: slot.name, idx: si, cues: r.cues.length, strategy: r.strategy, offset: r.offset,
                     segStart: seg.start, segDur: seg.dur, firstCue: r.cues[0] ? r.cues[0].s : null,
                     sample: body.substring(0, 160)
                   });
-                  kpDiagNote('subs_first_segment', 'cues=' + r.cues.length + ' strategy=' + r.strategy + ' seg=' + si + '/' + segs.length);
+                  kpDiagNote('subs_first_segment', slot.name + ' cues=' + r.cues.length + ' strategy=' + r.strategy + ' seg=' + si + '/' + segs.length);
                 }
-                merge(r.cues);
+                merge(slot, r.cues);
               }
               if (doneCount >= order.length) {
-                src.cues = cues;
-                Logger.info('subs', 'track loaded', { segments: segs.length, failed: failed, cues: cues.length, ms: Date.now() - t0 });
-                kpDiagNote('subs_loaded', 'cues=' + cues.length + ' segments=' + segs.length + ' failed=' + failed + ' ms=' + (Date.now() - t0));
-                if (kpDiagOn()) { try { Lampa.Noty.show('KP subs: ' + cues.length + ' cues / ' + segs.length + ' seg' + (failed ? ' / ' + failed + ' err' : '')); } catch (e) {} }
+                src.cues = slot.cues;
+                Logger.info('subs', 'track loaded', { slot: slot.name, segments: segs.length, failed: failed, cues: slot.cues.length, ms: Date.now() - t0 });
+                kpDiagNote('subs_loaded', slot.name + ' cues=' + slot.cues.length + ' segments=' + segs.length + ' failed=' + failed + ' ms=' + (Date.now() - t0));
+                if (kpDiagOn()) { try { Lampa.Noty.show('KP subs (' + slot.name + '): ' + slot.cues.length + ' cues / ' + segs.length + ' seg' + (failed ? ' / ' + failed + ' err' : '')); } catch (e) {} }
               } else pump();
             });
           })(order[next++]);
@@ -1837,33 +1842,43 @@
       pump();
     }
 
-    function select(item) {
-      var gen = ++seq;
-      active = item;
-      cues = [];
-      lastIdx = 0;
-      draw('');
+    function clearSlot(slot) {
+      slot.seq++;
+      slot.item = null;
+      slot.cues = [];
+      slot.lastIdx = 0;
+      slot.text = '';
+    }
+
+    function loadTrack(slot, item) {
+      var gen = ++slot.seq;
+      slot.item = item;
+      slot.cues = [];
+      slot.lastIdx = 0;
+      slot.text = '';
       var src = item && item.kp_src;
       if (!src || !src.uri) return;
-      if (src.cues) { cues = src.cues; return; }   // already fetched this session
-      Logger.info('subs', 'select', { label: item.label, uri: src.uri });
+      if (src.cues) { slot.cues = src.cues; return; }   // already fetched this session
+      Logger.info('subs', 'select ' + slot.name, { label: item.label, uri: src.uri });
       kpFetchText(src.uri, 10000, function (err, body, status) {
-        if (gen !== seq) return;
+        if (gen !== slot.seq) return;
         if (err) {
-          Logger.warn('subs', 'track fetch failed', { err: err, status: status, uri: src.uri });
-          kpDiagNote('subs_track_error', err + ' status=' + status + ' host=' + kpUrlHost(src.uri));
-          try { Lampa.Noty.show(Lampa.Lang.translate('kp_subs_error') + ' (' + err + ')'); } catch (e) {}
+          Logger.warn('subs', 'track fetch failed', { slot: slot.name, err: err, status: status, uri: src.uri });
+          kpDiagNote('subs_track_error', slot.name + ' ' + err + ' status=' + status + ' host=' + kpUrlHost(src.uri));
+          // Toast only for the track the user picked; a failed auto-picked
+          // learning track is logged but must not interrupt the working one.
+          if (slot === main) { try { Lampa.Noty.show(Lampa.Lang.translate('kp_subs_error') + ' (' + err + ')'); } catch (e) {} }
           return;
         }
         var head = String(body || '').replace(/^\uFEFF/, '').substring(0, 12);
         if (head.indexOf('#EXTM3U') !== 0) {
-          // A plain .vtt/.srt file (kinopub API urls, or a CDN that serves
-          // the text directly) — parse as-is.
+          // A plain .vtt/.srt file (media-links / item API urls, or a CDN
+          // that serves the text directly) — parse as-is.
           var r = parseCues(body, null);
-          cues = r.cues;
-          src.cues = cues;
-          Logger.info('subs', 'direct text loaded', { cues: cues.length, bytes: body.length });
-          kpDiagNote('subs_loaded', 'direct cues=' + cues.length);
+          slot.cues = r.cues;
+          src.cues = slot.cues;
+          Logger.info('subs', 'direct text loaded', { slot: slot.name, cues: slot.cues.length, bytes: body.length });
+          kpDiagNote('subs_loaded', slot.name + ' direct cues=' + slot.cues.length);
           return;
         }
         if (body.indexOf('#EXT-X-STREAM-INF') >= 0) {
@@ -1873,59 +1888,92 @@
         }
         var segs = parsePlaylist(body, src.uri);
         Logger.info('subs', 'rendition playlist', {
+          slot: slot.name,
           segments: segs.length,
           first: segs[0] ? segs[0].url : null,
           totalDur: segs.length ? Math.round(segs[segs.length - 1].start + segs[segs.length - 1].dur) : 0,
           head: body.substring(0, 200)
         });
-        kpDiagNote('subs_playlist', 'segments=' + segs.length + (segs[0] ? ' first=' + segs[0].url.replace(/\?.*$/, '').slice(-60) : ''));
+        kpDiagNote('subs_playlist', slot.name + ' segments=' + segs.length + (segs[0] ? ' first=' + segs[0].url.replace(/\?.*$/, '').slice(-60) : ''));
         if (!segs.length) return;
-        loadSegments(segs, gen, src);
+        loadSegments(slot, segs, gen, src);
       });
     }
 
-    function deselect() {
-      seq++;
-      active = null;
-      cues = [];
-      lastIdx = 0;
-      draw('');
-    }
-
-    function update(t) {
-      if (!active || typeof t !== 'number' || isNaN(t)) return;
-      var shift = 0;
-      try { shift = parseInt(Lampa.Storage.get('player_subs_shift_time', '0'), 10) || 0; } catch (e) {}
-      t = t - shift;
-      var text = '';
+    function textAt(slot, t) {
+      if (!slot.item) return '';
+      var cues = slot.cues;
       var n = cues.length;
+      var text = '';
       if (n) {
-        if (lastIdx >= n || cues[lastIdx].s > t) lastIdx = 0;
-        for (var i = lastIdx; i < n; i++) {
+        if (slot.lastIdx >= n || cues[slot.lastIdx].s > t) slot.lastIdx = 0;
+        for (var i = slot.lastIdx; i < n; i++) {
           var c = cues[i];
           if (c.s > t) break;
-          lastIdx = i;
+          slot.lastIdx = i;
           if (t < c.e) { text = c.t; break; }
         }
       }
-      draw(text);
+      return text;
+    }
+
+    // One box, two lines: the learning track above (default) or below the
+    // main one. Lines are independent — cue timings of two languages never
+    // match exactly, so each line follows its own track.
+    function compose() {
+      var a = main.text;
+      var b = second.item ? second.text : '';
+      if (!second.item) return a;
+      if (!a && !b) return '';
+      var pos = 'top';
+      try { pos = String(Lampa.Storage.get(KEY_SUBS_SECOND_POS, 'top') || 'top'); } catch (e) {}
+      // Both rows are always emitted (empty one keeps its line box): Lampa's
+      // subtitle box is anchored to the bottom of the screen, so dropping a
+      // row would shift the remaining line up/down at every cue boundary.
+      var mainHtml = '<div class="kp-dual__main' + (a ? '' : ' kp-dual__empty') + '">' + (a ? a : '&nbsp;') + '</div>';
+      var secHtml  = '<div class="kp-dual__second' + (b ? '' : ' kp-dual__empty') + '">' + (b ? b : '&nbsp;') + '</div>';
+      return '<div class="kp-dual">' + (pos === 'bottom' ? mainHtml + secHtml : secHtml + mainHtml) + '</div>';
+    }
+
+    function update(t) {
+      if (!main.item || typeof t !== 'number' || isNaN(t)) return;
+      var shift = 0;
+      try { shift = parseInt(Lampa.Storage.get('player_subs_shift_time', '0'), 10) || 0; } catch (e) {}
+      t = t - shift;
+      main.text   = textAt(main, t);
+      second.text = textAt(second, t);
+      draw(compose());
+    }
+
+    function select(item)       { loadTrack(main, item); }
+    function selectSecond(item) { loadTrack(second, item); }
+    function clearSecond()      { clearSlot(second); if (main.item) draw(compose()); }
+
+    function deselect() {
+      clearSlot(main);
+      clearSlot(second);
+      draw('');
     }
 
     function reset() {
       deselect();
-      lastText = null;
+      lastHtml = null;
     }
 
     return {
-      select:   select,
-      deselect: deselect,
-      update:   update,
-      reset:    reset,
-      isActive: function (item) { return !!active && active === item; },
-      // exposed for offline tests (smoke-test.js) — not used at runtime
+      select:       select,
+      selectSecond: selectSecond,
+      clearSecond:  clearSecond,
+      deselect:     deselect,
+      update:       update,
+      reset:        reset,
+      isActive:     function (item) { return !!main.item && main.item === item; },
+      active:       function () { return main.item; },
+      secondActive: function () { return second.item; },
+      // exposed for offline tests (subs-test.js) — not used at runtime
       parseCues:     parseCues,
       parsePlaylist: parsePlaylist,
-      active:   function () { return active; }
+      compose:       compose
     };
   })();
 
@@ -1936,8 +1984,9 @@
 
   function kpBuildSubItems(hlsList, apiList) {
     var items = [];
-    function add(label, src) {
-      var item = { index: items.length, label: label, selected: false, ready: true, kp_src: src };
+    function add(label, src, lang, forced) {
+      var item = { index: items.length, label: label, selected: false, ready: true, kp_src: src,
+                   lang: String(lang || '').toLowerCase(), forced: !!forced };
       // `ready: true` stops Lampa's Subtitles.custom() from attaching its own
       // .srt loader; our accessor drives the renderer instead. Lampa's panel
       // sets mode='showing' / 'disabled' and toggles `selected`.
@@ -1950,6 +1999,7 @@
             item.selected = true;
             kpSubsLast = { label: item.label };
             KpSubs.select(item);
+            kpApplySecondTrack(item);
           } else if (KpSubs.isActive(item)) {
             KpSubs.deselect();
           }
@@ -1959,14 +2009,60 @@
     }
     var labels = kpSubLabels(hlsList);
     for (var i = 0; i < hlsList.length; i++) {
-      add(labels[i], { uri: hlsList[i].uri, hls: !!hlsList[i].name });
+      add(labels[i], { uri: hlsList[i].uri, hls: !!hlsList[i].name }, hlsList[i].lang, hlsList[i].forced);
     }
     if (!hlsList.length) {
       for (var j = 0; j < apiList.length; j++) {
-        if (apiList[j] && apiList[j].url) add(apiList[j].label || ('sub ' + (j + 1)), { uri: apiList[j].url, hls: false });
+        if (apiList[j] && apiList[j].url) add(apiList[j].label || ('sub ' + (j + 1)), { uri: apiList[j].url, hls: false }, apiList[j].lang, apiList[j].forced);
       }
     }
     return items;
+  }
+
+  /* ── Dual subtitles (v1.0.78): second language track for learning ──── */
+
+  function kpSecondLang() {
+    var v = String(Lampa.Storage.get(KEY_SUBS_SECOND, 'eng') || 'eng');
+    return (v === 'eng' || v === 'rus' || v === 'ukr') ? v : 'off';
+  }
+
+  /**
+   * Picks the learning track for the given primary item from the current
+   * list: same language as the setting, non-forced first, never the primary
+   * itself, nothing when the primary already is that language.
+   */
+  function kpPickSecond(items, lang, primary) {
+    if (!items || lang === 'off') return null;
+    var i, it;
+    for (i = 0; i < items.length; i++) {
+      it = items[i];
+      if (!it || it.index === -1 || it === primary || !it.kp_src) continue;
+      if (it.lang === lang && !it.forced) return it;
+    }
+    for (i = 0; i < items.length; i++) {
+      it = items[i];
+      if (!it || it.index === -1 || it === primary || !it.kp_src) continue;
+      if (it.lang === lang) return it;
+    }
+    return null;
+  }
+
+  function kpApplySecondTrack(primary) {
+    var lang = kpSecondLang();
+    if (lang === 'off' || !primary) { KpSubs.clearSecond(); return; }
+    if (String(primary.lang || '') === lang) {
+      KpSubs.clearSecond();
+      kpDiagNote('subs_second', 'skipped: primary is already ' + lang);
+      return;
+    }
+    var pick = kpPickSecond(kpSubItems, lang, primary);
+    if (!pick) {
+      KpSubs.clearSecond();
+      kpDiagNote('subs_second', 'no ' + lang + ' track in list');
+      return;
+    }
+    kpDiagNote('subs_second', pick.label);
+    KpSubs.selectSecond(pick);
   }
 
   function kpInstallSubItems(items, data) {
@@ -2812,8 +2908,10 @@
     if (!subs || !subs.length) return [];
     return subs.map(function (s) {
       return {
-        label: (s.lang || s.title || 'sub') + (s.shift ? ' (' + s.shift + 's)' : ''),
-        url:   s.url
+        label:  (s.lang || s.title || 'sub') + (s.shift ? ' (' + s.shift + 's)' : ''),
+        url:    s.url,
+        lang:   s.lang || '',
+        forced: !!s.forced
       };
     }).filter(function (s) { return !!s.url; });
   }
@@ -4727,6 +4825,12 @@
       ".simple-button.simple-button--filter.filter--filter.focus::after{display:none !important}" +
       // Back button (filter--back) — also reset margin in case it leaks gap
       ".simple-button.filter--back{margin:0 .4em 0 0 !important}" +
+      // v1.0.78: dual subtitles — second (learning) line slightly smaller,
+      // warm tint so the eye separates the languages instantly.
+      ".kp-dual{display:inline-block;text-align:center}" +
+      ".kp-dual__second{font-size:.82em;line-height:1.25;color:#f3e6b0;opacity:.95}" +
+      ".kp-dual__main{line-height:1.25}" +
+      ".kp-dual__second+.kp-dual__main,.kp-dual__main+.kp-dual__second{margin-top:.3em}" +
       "</style>");
     $('body').append(Lampa.Template.get('online_prestige_css', {}, true));
   }
@@ -4885,6 +4989,36 @@
       },
       field: { name: Lampa.Lang.translate('kp_set_subs_mode'), description: Lampa.Lang.translate('kp_set_subs_mode_descr') },
       onChange: function (v) { Logger.info('subs', 'mode changed', { mode: v }); }
+    });
+
+    if (Lampa.Storage.get(KEY_SUBS_SECOND, '') === '') Lampa.Storage.set(KEY_SUBS_SECOND, 'eng');
+    if (Lampa.Storage.get(KEY_SUBS_SECOND_POS, '') === '') Lampa.Storage.set(KEY_SUBS_SECOND_POS, 'top');
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
+      param: {
+        name: KEY_SUBS_SECOND, type: 'select',
+        values: {
+          'off': Lampa.Lang.translate('kp_subs_second_off'),
+          'eng': Lampa.Lang.translate('kp_subs_second_eng'),
+          'rus': Lampa.Lang.translate('kp_subs_second_rus'),
+          'ukr': Lampa.Lang.translate('kp_subs_second_ukr')
+        },
+        "default": 'eng'
+      },
+      field: { name: Lampa.Lang.translate('kp_set_subs_second'), description: Lampa.Lang.translate('kp_set_subs_second_descr') },
+      onChange: function (v) {
+        Logger.info('subs', 'second track changed', { lang: v });
+        try { kpApplySecondTrack(KpSubs.active()); } catch (e) {}
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
+      param: {
+        name: KEY_SUBS_SECOND_POS, type: 'select',
+        values: { 'top': Lampa.Lang.translate('kp_subs_second_top'), 'bottom': Lampa.Lang.translate('kp_subs_second_bottom') },
+        "default": 'top'
+      },
+      field: { name: Lampa.Lang.translate('kp_set_subs_second_pos'), description: Lampa.Lang.translate('kp_set_subs_second_pos_descr') }
     });
 
     Lampa.SettingsApi.addParam({
@@ -5102,6 +5236,32 @@
       kp_subs_mode_native: { ru: 'Через плеер ТВ (proxy 1.2+)',        en: 'Via TV player (proxy 1.2+)',          ua: 'Через плеєр ТВ (proxy 1.2+)' },
       kp_subs_mode_api:    { ru: 'Только API kinopub (старое)',        en: 'kinopub API only (legacy)',           ua: 'Лише API kinopub' },
       kp_subs_mode_off:    { ru: 'Выключены',                          en: 'Off',                                 ua: 'Вимкнено' },
+      kp_set_subs_second: {
+        ru: 'Вторая дорожка субтитров',
+        en: 'Second subtitle track',
+        ua: 'Друга доріжка субтитрів'
+      },
+      kp_set_subs_second_descr: {
+        ru: 'Для изучения языка: вместе с выбранной в плеере дорожкой показывать вторую на другом языке (берётся из списка kinopub автоматически). Не показывается, если основная дорожка того же языка.',
+        en: 'Language learning: show a second track in another language alongside the one chosen in the player (picked from the kinopub list automatically). Hidden when the main track is the same language.',
+        ua: 'Для вивчення мови: разом з обраною доріжкою показувати другу іншою мовою. Не показується, якщо основна тієї ж мови.'
+      },
+      kp_subs_second_off: { ru: 'Выкл',        en: 'Off',       ua: 'Вимк' },
+      kp_subs_second_eng: { ru: 'Английские',  en: 'English',   ua: 'Англійські' },
+      kp_subs_second_rus: { ru: 'Русские',     en: 'Russian',   ua: 'Російські' },
+      kp_subs_second_ukr: { ru: 'Украинские',  en: 'Ukrainian', ua: 'Українські' },
+      kp_set_subs_second_pos: {
+        ru: 'Положение второй дорожки',
+        en: 'Second track position',
+        ua: 'Розташування другої доріжки'
+      },
+      kp_set_subs_second_pos_descr: {
+        ru: 'Сверху = вторая строка над основной (оригинал читаете первым), снизу = под основной.',
+        en: 'Top = second line above the main one, bottom = below it.',
+        ua: 'Зверху = над основною, знизу = під основною.'
+      },
+      kp_subs_second_top:    { ru: 'Сверху', en: 'Top',    ua: 'Зверху' },
+      kp_subs_second_bottom: { ru: 'Снизу',  en: 'Bottom', ua: 'Знизу' },
       kp_set_diag: {
         ru: 'Диагностика субтитров',
         en: 'Subtitle diagnostics',

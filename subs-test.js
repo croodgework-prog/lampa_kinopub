@@ -57,7 +57,7 @@ let src = fs.readFileSync(path.join(__dirname, 'docs', 'kp.js'), 'utf8');
 const tail = '  startPlugin();\n\n})();';
 assert(src.endsWith(tail + '\n') || src.endsWith(tail), 'kp.js tail changed — update subs-test.js');
 src = src.replace(tail,
-  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpSubLabels, kpMediaLinksToList, kpSortSubs, kpBuildSubItems, kpSubsModeResolved };\n})();');
+  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpSubLabels, kpMediaLinksToList, kpSortSubs, kpBuildSubItems, kpSubsModeResolved, kpPickSecond, kpSecondLang };\n})();');
 new Function(src)();
 const T = global.__kpTest;
 assert(T, 'plugin did not boot (early return?)');
@@ -157,6 +157,30 @@ const mlabels = T.kpSubLabels(mlist);
 ok(mlabels.join('|') === 'Русские 1 (forced)|Русские 2|Английские|Арабские|Испанские 1|Испанские 2', 'media-links labels: ' + mlabels.join('|'));
 const mitems = T.kpBuildSubItems(mlist, []);
 ok(mitems.length === 6 && mitems[0].kp_src.uri.indexOf('.srt') > 0 && mitems[0].kp_src.hls === false, 'items from media-links carry direct .srt urls');
+
+// ── 7c. dual subtitles ────────────────────────────────────────────────────
+ok(T.kpSecondLang() === 'eng', 'second track defaults to eng');
+const dItems = T.kpBuildSubItems(mlist, []);
+const pRu = dItems[1]; // Русские 2
+const pick = T.kpPickSecond(dItems, 'eng', pRu);
+ok(pick && pick.lang === 'eng' && !pick.forced, 'picks non-forced English for a Russian primary');
+ok(T.kpPickSecond(dItems, 'eng', pick) === null, 'no second when the only English track is the primary');
+ok(T.kpPickSecond(dItems, 'ara', pRu).lang === 'ara' && T.kpPickSecond(dItems, 'jpn', pRu) === null, 'lang match / no match');
+// compose: preload cues, select main + second, update at t
+pRu.kp_src.cues  = [{ s: 1, e: 3, t: 'Привет' }];
+pick.kp_src.cues = [{ s: 1.2, e: 2.8, t: 'Hello' }];
+T.KpSubs.select(pRu); T.KpSubs.selectSecond(pick);
+T.KpSubs.update(2);
+ok(T.KpSubs.compose() === '<div class="kp-dual"><div class="kp-dual__second">Hello</div><div class="kp-dual__main">Привет</div></div>', 'dual box, second on top: ' + T.KpSubs.compose());
+storage.kp_subs_second_pos = 'bottom';
+ok(T.KpSubs.compose().indexOf('kp-dual__main">Привет</div><div class="kp-dual__second">Hello') > 0, 'position bottom');
+storage.kp_subs_second_pos = 'top';
+T.KpSubs.update(2.9);
+ok(T.KpSubs.compose() === '<div class="kp-dual"><div class="kp-dual__second kp-dual__empty">&nbsp;</div><div class="kp-dual__main">Привет</div></div>', 'empty second row keeps its line box (no vertical jump): ' + T.KpSubs.compose());
+T.KpSubs.clearSecond(); T.KpSubs.update(2);
+ok(T.KpSubs.compose() === 'Привет', 'plain text when no second track');
+T.KpSubs.deselect();
+ok(T.KpSubs.active() === null && T.KpSubs.secondActive() === null, 'deselect clears both');
 
 // ── 8. Proxy: subs pass-through ───────────────────────────────────────────
 let psrc = fs.readFileSync(path.join(__dirname, 'proxy-server', 'server.js'), 'utf8');
