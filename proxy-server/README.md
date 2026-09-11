@@ -19,6 +19,14 @@ GET /health
 GET /manifest-proxy?master=<url-encoded-kinopub-master>&voice=<1..12>
   → application/vnd.apple.mpegurl
   → reduced master (1 audio rendition + best video stream-inf)
+
+GET /manifest-proxy?master=<...>&voice=<N>&subs=1        (v1.2.0+)
+  → то же, но все #EXT-X-MEDIA:TYPE=SUBTITLES из оригинального master
+    остаются (URI приводятся к абсолютным — kinopub отдаёт их
+    root-relative относительно хоста master), а в #EXT-X-STREAM-INF
+    добавляется SUBTITLES="sub". Нужен для режима субтитров
+    «Через плеер ТВ» в kp.js: Tizen AVPlay сам показывает их как TEXT-дорожки.
+    Без параметра вывод байт-в-байт как в v1.1.6.
 ```
 
 ## Безопасность

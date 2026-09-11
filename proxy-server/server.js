@@ -10,13 +10,19 @@
  *
  * This server fetches the kinopub master, picks one audio rendition
  * (chosen by index from the URL) + the best video stream-inf, drops
- * subtitles and I-FRAME entries, and returns a 600-800 byte master
- * that AVPlayer demuxes in 2 tracks total. URLs INSIDE the master
- * still point at kinopub CDN, so segments are fetched directly by
- * the player — VPS only proxies the master itself.
+ * I-FRAME entries, and returns a small master that AVPlayer demuxes
+ * in 2 tracks total. URLs INSIDE the master still point at kinopub
+ * CDN, so segments are fetched directly by the player — VPS only
+ * proxies the master itself.
+ *
+ * v1.2.0: optional `&subs=1` keeps every `#EXT-X-MEDIA:TYPE=SUBTITLES`
+ * rendition (URIs absolutized against the kinopub master, since kinopub
+ * emits them root-relative) and adds SUBTITLES="sub" to the stream-inf,
+ * so Tizen AVPlay lists them as TEXT tracks. Without the flag the
+ * output is byte-identical to v1.1.6 (subtitles dropped).
  *
  * Endpoints:
- *   GET /manifest-proxy?master=<encoded-kinopub-url>&voice=<1..12>
+ *   GET /manifest-proxy?master=<encoded-kinopub-url>&voice=<1..12>[&subs=1]
  *                       → application/vnd.apple.mpegurl reduced master
  *   GET /health         → { ok: true, version, uptime, cache, hits }
  *
@@ -38,7 +44,7 @@ const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS || '60000', 10);
 const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS || '10000', 10);
 const VOICE_SYNC_DIR = process.env.VOICE_SYNC_DIR || '/var/data/voice-sync';
 const VOICE_SYNC_MAX_BYTES = parseInt(process.env.VOICE_SYNC_MAX_BYTES || '65536', 10);
-const VERSION  = '1.1.6';
+const VERSION  = '1.2.0';
 const STARTED  = Date.now();
 
 try { fs.mkdirSync(VOICE_SYNC_DIR, { recursive: true }); } catch (e) {
@@ -130,21 +136,26 @@ function parseAttrs(s) {
 function parseHls4Master(text) {
   const lines = text.split(/\r?\n/);
   const audioGroups = {};
+  const subtitlesGroups = {};
   const streamInfs = [];
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     if (!l) continue;
     if (l.indexOf('#EXT-X-MEDIA:') === 0) {
       const attrs = parseAttrs(l.substring('#EXT-X-MEDIA:'.length));
+      const entry = {
+        name:  attrs.NAME || '',
+        lang:  attrs.LANGUAGE || '',
+        deflt: attrs.DEFAULT === 'YES',
+        uri:   attrs.URI || '',
+        attrs
+      };
       if (attrs.TYPE === 'AUDIO') {
         const g = attrs['GROUP-ID'] || 'audio';
-        (audioGroups[g] = audioGroups[g] || []).push({
-          name:  attrs.NAME || '',
-          lang:  attrs.LANGUAGE || '',
-          deflt: attrs.DEFAULT === 'YES',
-          uri:   attrs.URI || '',
-          attrs
-        });
+        (audioGroups[g] = audioGroups[g] || []).push(entry);
+      } else if (attrs.TYPE === 'SUBTITLES') {
+        const sg = attrs['GROUP-ID'] || 'sub';
+        (subtitlesGroups[sg] = subtitlesGroups[sg] || []).push(entry);
       }
     } else if (l.indexOf('#EXT-X-STREAM-INF:') === 0) {
       const sattrs = parseAttrs(l.substring('#EXT-X-STREAM-INF:'.length));
@@ -156,6 +167,7 @@ function parseHls4Master(text) {
       streamInfs.push({
         attrs: sattrs,
         audioGroup: sattrs.AUDIO || '',
+        subsGroup:  sattrs.SUBTITLES || '',
         videoUri:   uri,
         bandwidth:  parseInt(sattrs.BANDWIDTH || '0', 10) || 0,
         resolution: sattrs.RESOLUTION || '',
@@ -163,7 +175,14 @@ function parseHls4Master(text) {
       });
     }
   }
-  return { audioGroups, streamInfs };
+  return { audioGroups, subtitlesGroups, streamInfs };
+}
+
+/** Absolutize a (possibly root-relative) rendition URI against the master URL. */
+function absolutize(uri, masterUrl) {
+  if (!uri) return uri;
+  if (/^[a-z][a-z0-9+.\-]*:/i.test(uri)) return uri;
+  try { return new URL(uri, masterUrl).href; } catch (e) { return uri; }
 }
 
 /**
@@ -175,7 +194,8 @@ function parseHls4Master(text) {
  * NAME of the chosen audio (e.g. "04. Многоголосый. NewStudio (RUS)") so
  * the caller can log it for diagnostics.
  */
-function buildReducedMaster(parsed, voiceIndex) {
+function buildReducedMaster(parsed, voiceIndex, opts) {
+  opts = opts || {};
   const out = ['#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-INDEPENDENT-SEGMENTS'];
 
   // v1.1.6 rollback: always pick highest-bandwidth video stream-inf.
@@ -212,16 +232,43 @@ function buildReducedMaster(parsed, voiceIndex) {
            '",LANGUAGE="' + (pickedEntry.lang || 'und') +
            '",DEFAULT=YES,AUTOSELECT=YES,URI="' + pickedEntry.uri + '"');
 
+  // v1.2.0: optional subtitle pass-through. kinopub emits the renditions
+  // root-relative ("/hls/<token>/subtitles/x/yy/NNN.srt/index.m3u8?loc=nl"),
+  // i.e. relative to the kinopub master host — inside a master served from
+  // this proxy they MUST be absolutized or the player would ask the proxy
+  // for them. NAME kept as kinopub's ("RUS #01") — it's ASCII already.
+  let subsCount = 0;
+  if (opts.subs) {
+    const sg = bestStreamInf.subsGroup && parsed.subtitlesGroups[bestStreamInf.subsGroup]
+      ? parsed.subtitlesGroups[bestStreamInf.subsGroup]
+      : [].concat(...Object.keys(parsed.subtitlesGroups).map(k => parsed.subtitlesGroups[k]));
+    const seen = new Set();
+    for (const s of sg) {
+      if (!s.uri) continue;
+      const abs = absolutize(s.uri, opts.masterUrl);
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+      subsCount++;
+      const name = (s.name || ('Sub ' + subsCount)).replace(/"/g, '');
+      out.push('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="sub",NAME="' + name +
+               '",LANGUAGE="' + (s.lang || 'und') +
+               '",DEFAULT=NO,AUTOSELECT=NO' +
+               (s.attrs && s.attrs.FORCED === 'YES' ? ',FORCED=YES' : '') +
+               ',URI="' + abs + '"');
+    }
+  }
+
   const parts = [];
   if (bestStreamInf.bandwidth)  parts.push('BANDWIDTH=' + bestStreamInf.bandwidth);
   if (bestStreamInf.resolution) parts.push('RESOLUTION=' + bestStreamInf.resolution);
   if (bestStreamInf.codecs)     parts.push('CODECS="' + bestStreamInf.codecs + '"');
   if (bestStreamInf.attrs['FRAME-RATE']) parts.push('FRAME-RATE=' + bestStreamInf.attrs['FRAME-RATE']);
   parts.push('AUDIO="aud"');
+  if (subsCount) parts.push('SUBTITLES="sub"');
   out.push('#EXT-X-STREAM-INF:' + parts.join(','));
   out.push(bestStreamInf.videoUri);
 
-  return { text: out.join('\n') + '\n', pickedName: pickedEntry.name };
+  return { text: out.join('\n') + '\n', pickedName: pickedEntry.name, subsCount };
 }
 
 /* ──────────────────────────────────────────────────────────────────── *
@@ -288,6 +335,8 @@ async function handleManifestProxy(req, res) {
   const master = u.searchParams.get('master');
   const voiceRaw = u.searchParams.get('voice') || '1';
   const voice = Math.min(Math.max(parseInt(voiceRaw, 10) || 1, 1), 99);
+  // v1.2.0: &subs=1 keeps subtitle renditions (see buildReducedMaster)
+  const subs = u.searchParams.get('subs') === '1';
 
   if (!master) {
     logLine(req, 400, 'no master');
@@ -315,11 +364,11 @@ async function handleManifestProxy(req, res) {
     });
   }
 
-  const cacheKey = master + '|v=' + voice;
+  const cacheKey = master + '|v=' + voice + (subs ? '|s=1' : '');
   const cached = cacheGet(cacheKey);
   if (cached) {
     cacheHits++;
-    logLine(req, 200, `voice=${voice} cache=HIT bytes=${cached.length}`);
+    logLine(req, 200, `voice=${voice} subs=${subs ? 1 : 0} cache=HIT bytes=${cached.length}`);
     res.writeHead(200, {
       'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -335,10 +384,10 @@ async function handleManifestProxy(req, res) {
     const text = await httpsGet(master, FETCH_TIMEOUT_MS);
     const parsed = parseHls4Master(text);
     const audioGroupCount = Object.keys(parsed.audioGroups).length;
-    const result = buildReducedMaster(parsed, voice);
+    const result = buildReducedMaster(parsed, voice, { subs, masterUrl: master });
     const reduced = result.text;
     cacheSet(cacheKey, reduced);
-    logLine(req, 200, `voice=${voice} picked="${result.pickedName || '?'}" groups=${audioGroupCount} reduced=${reduced.length}`);
+    logLine(req, 200, `voice=${voice} subs=${subs ? result.subsCount : 0} picked="${result.pickedName || '?'}" groups=${audioGroupCount} reduced=${reduced.length}`);
     res.writeHead(200, {
       'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
       'Cache-Control': 'no-store',

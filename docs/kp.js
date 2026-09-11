@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.73';
+  var PLUGIN_VERSION  = '1.0.74';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -68,6 +68,10 @@
   // false — unreachable, fall back to HLS2-only mode
   var kpProxyAvailable = null;
 
+  // v1.0.74: proxy version string from /health (e.g. '1.2.0'). Gates the
+  // 'native' subtitle mode — proxy < 1.2.0 strips subtitle renditions.
+  var kpProxyVersion = '';
+
   // v1.0.66: voice-sync state. kpUserId is the kinopub username (extracted
   // from /v1/user response); used as namespace key in VPS voice-sync store.
   // No auth — personal use only. Pull on full/complite, push debounced on
@@ -92,7 +96,17 @@
   var KEY_MAX_QUAL    = 'kp_max_quality';
   var KEY_FORMAT      = 'kp_format';
   var KEY_PROXY       = 'kp_proxy';
-  var KEY_SUBS        = 'kp_subtitles_enabled';
+  var KEY_SUBS        = 'kp_subtitles_enabled'; // legacy (v1.0.x) — superseded by KEY_SUBS_MODE
+  // v1.0.74: subtitle source mode + diagnostics (see SUBTITLES section).
+  //   auto   → 'hls' (all EXT-X-MEDIA:TYPE=SUBTITLES renditions from the
+  //            kinopub HLS4 master, rendered by the plugin via Lampa overlay)
+  //   hls    → same, forced
+  //   native → keep renditions inside the (proxied) master so the TV player
+  //            (Tizen AVPlay) lists them itself; needs manifest-proxy >= 1.2.0
+  //   api    → legacy: only kinopub API subtitles[] (.srt/.vtt) as play.subtitles
+  //   off    → no subtitles at all
+  var KEY_SUBS_MODE   = 'kp_subs_mode';
+  var KEY_DIAG        = 'kp_diag';
 
   /* ============================================================ *
    *  LOGGER                                                      *
@@ -544,6 +558,11 @@
       saveDeviceSettings: function (network, deviceId, settings, ok, err) {
         apiPost(network, '/device/' + deviceId + '/settings', settings, ok, err);
       },
+      // v1.0.74: diagnostics only — /v1/items/media-links?mid= returns the
+      // per-media file + subtitles[] list (Lampac uses it as a fallback).
+      mediaLinks: function (network, mid, ok, err) {
+        api(network, '/items/media-links', { mid: mid }, ok, err);
+      },
       deviceNotify: function (network, info, ok, err) {
         // POST form-encoded title/hardware/software — kinoapi.com docs say
         // "call after auth and on every plugin start"
@@ -672,15 +691,14 @@
   function dumpStreamManifest(url) {
     if (!url) return;
     try {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.timeout = 5000;
-      xhr.onload = function () {
-        if (xhr.status < 200 || xhr.status >= 300) {
-          Logger.warn('manifest', 'fetch non-2xx', { status: xhr.status, url: url });
+      // v1.0.74: shared cached fetch — kpOnPlayerStart() reuses the same
+      // master body for subtitle extraction instead of downloading it twice.
+      kpFetchMaster(url, function (err, body, status) {
+        if (err) {
+          Logger.warn('manifest', 'fetch failed', { err: err, status: status, url: url });
           return;
         }
-        var body = xhr.responseText || '';
+        body = body || '';
         // Keep only the diagnostic-relevant lines so we don't flood the log
         // with thousands of segment URIs.
         var lines = body.split(/\r?\n/);
@@ -706,10 +724,7 @@
           lineCount: lines.length,
           keep:     keep
         });
-      };
-      xhr.onerror   = function () { Logger.warn('manifest', 'fetch error', { url: url }); };
-      xhr.ontimeout = function () { Logger.warn('manifest', 'fetch timeout', { url: url }); };
-      xhr.send();
+      });
     } catch (e) {
       Logger.warn('manifest', 'dump failed', String(e));
     }
@@ -735,6 +750,13 @@
         return { index: t.index, type: t.type, extra: ex };
       });
       Logger.info('avplay', source, { state: state, tracks: dump });
+      // v1.0.74: subtitle diagnostics — how many TEXT tracks AVPlay itself sees
+      var textCount = 0, audioCount = 0;
+      for (var ti = 0; ti < dump.length; ti++) {
+        if (dump[ti].type === 'TEXT')  textCount++;
+        if (dump[ti].type === 'AUDIO') audioCount++;
+      }
+      kpDiagNote('avplay_tracks', 'audio=' + audioCount + ' text=' + textCount + ' state=' + state);
     } catch (e) {
       Logger.warn('avplay', 'dump failed', String(e));
     }
@@ -810,6 +832,7 @@
           try {
             var j = JSON.parse(xhr.responseText || '{}');
             info = (j.service || '') + ' v' + (j.version || '?');
+            kpProxyVersion = String(j.version || '');
           } catch (e) {}
           Logger.info('proxy', 'available', { url: KP_PROXY_URL, info: info, attempt: attempt });
         } else {
@@ -978,9 +1001,13 @@
   function proxyUrlFor(masterUrl, voiceIndex) {
     if (!kpProxyAvailable || !masterUrl) return null;
     var base = KP_PROXY_URL.replace(/\/+$/, '');
+    // v1.0.74: in 'native' subtitle mode ask the proxy (>= 1.2.0) to keep
+    // the SUBTITLES renditions in the reduced master so Tizen AVPlay can
+    // list them as TEXT tracks. Every other mode keeps the v1.0.73 URL.
+    var subsParam = (kpSubsModeResolved() === 'native') ? '&subs=1' : '';
     return base + '/manifest-proxy?master=' +
            encodeURIComponent(masterUrl) +
-           '&voice=' + voiceIndex;
+           '&voice=' + voiceIndex + subsParam;
   }
 
   /**
@@ -1356,6 +1383,735 @@
       Logger.warn('blob-test', 'fetch setup failed', String(e));
       cb(null, null, null);
     }
+  }
+
+  /* ============================================================ *
+   *  SUBTITLES (v1.0.74)                                          *
+   *                                                               *
+   *  Why: kinopub API `subtitles[]` lists 0-3 external files, but *
+   *  the HLS4 master of the same file carries EVERY subtitle as   *
+   *  `#EXT-X-MEDIA:TYPE=SUBTITLES` (7-40 renditions, the list the *
+   *  kino.pub website shows). The manifest-proxy (v1.0.30+)       *
+   *  strips them, and Lampa ignores embedded text tracks when     *
+   *  play.subtitles is set (PlayerVideo.loaded(): customSubs ||   *
+   *  textTracks). Net result on Samsung: 0-3 tracks.              *
+   *                                                               *
+   *  Modes (KEY_SUBS_MODE): auto|hls → fetch the HLS4 master on   *
+   *  the TV, parse SUBTITLES renditions, expose them to Lampa's   *
+   *  panel as a custom list and render cues ourselves (rendition  *
+   *  URI is an HLS playlist of WebVTT segments — Lampa's own      *
+   *  loader only understands a plain .srt/.vtt file).             *
+   *  native → proxy keeps renditions in the reduced master, the   *
+   *  TV player (AVPlay) lists them as TEXT tracks itself.         *
+   *  api → legacy play.subtitles from API. off → nothing.          *
+   * ============================================================ */
+
+  function kpSubsMode() {
+    var v = String(Lampa.Storage.get(KEY_SUBS_MODE, 'auto') || 'auto');
+    if (v === 'auto' || v === 'hls' || v === 'native' || v === 'api' || v === 'off') return v;
+    return 'auto';
+  }
+
+  // manifest-proxy >= 1.2.0 understands &subs=1 (keeps SUBTITLES renditions).
+  function kpProxySupportsSubs() {
+    if (kpProxyAvailable !== true) return false;
+    var p = String(kpProxyVersion || '').split('.');
+    var maj = parseInt(p[0], 10) || 0;
+    var min = parseInt(p[1], 10) || 0;
+    return maj > 1 || (maj === 1 && min >= 2);
+  }
+
+  function kpSubsModeResolved() {
+    var m = kpSubsMode();
+    if (m === 'native' && !kpProxySupportsSubs()) return 'hls'; // proxy too old / absent
+    if (m === 'auto') return 'hls';
+    return m;
+  }
+
+  function kpDiagOn() {
+    try { return !!Lampa.Storage.get(KEY_DIAG, false); } catch (e) { return false; }
+  }
+
+  /**
+   * RFC-3986-ish URL resolver, ES5. Handles absolute, protocol-relative
+   * (//host/x), root-relative (/x), and relative (x, ./x, ../x) references;
+   * keeps the reference's own query string; never touches the base query.
+   */
+  function kpResolveUrl(base, rel) {
+    rel = String(rel || '').replace(/^\s+|\s+$/g, '');
+    if (!rel) return '';
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(rel)) return rel;
+    var m = String(base || '').match(/^([a-z][a-z0-9+.\-]*:)\/\/([^\/?#]+)([^?#]*)/i);
+    if (!m) return rel;
+    var scheme = m[1];
+    var host   = m[2];
+    var path   = m[3] || '/';
+    if (rel.indexOf('//') === 0) return scheme + rel;
+    if (rel.charAt(0) === '/')   return scheme + '//' + host + rel;
+    if (rel.charAt(0) === '?' || rel.charAt(0) === '#') return scheme + '//' + host + path + rel;
+    var tail = '';
+    var qi = rel.search(/[?#]/);
+    if (qi >= 0) { tail = rel.substring(qi); rel = rel.substring(0, qi); }
+    var dir  = path.substring(0, path.lastIndexOf('/') + 1);
+    var segs = (dir + rel).split('/');
+    var out  = [];
+    for (var i = 0; i < segs.length; i++) {
+      var s = segs[i];
+      if (s === '.') continue;
+      if (s === '..') { if (out.length > 1) out.pop(); continue; }
+      out.push(s);
+    }
+    return scheme + '//' + host + out.join('/') + tail;
+  }
+
+  function kpUrlHost(u) {
+    var m = String(u || '').match(/^[a-z][a-z0-9+.\-]*:\/\/([^\/?#]+)/i);
+    return m ? m[1] : '';
+  }
+
+  /** Plain-text GET with timeout. cb(err, body, status). err is null on 2xx. */
+  function kpFetchText(url, timeoutMs, cb) {
+    var done = false;
+    function finish(err, body, status) {
+      if (done) return;
+      done = true;
+      try { cb(err, body, status); }
+      catch (e) { Logger.warn('subs', 'fetch callback threw', String(e)); }
+    }
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.timeout = timeoutMs || 8000;
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) finish(null, xhr.responseText || '', xhr.status);
+        else finish('http_' + xhr.status, xhr.responseText || '', xhr.status);
+      };
+      xhr.onerror   = function () { finish('network', '', xhr.status || 0); };
+      xhr.ontimeout = function () { finish('timeout', '', 0); };
+      xhr.send();
+    } catch (e) {
+      finish('throw:' + String(e), '', 0);
+    }
+  }
+
+  // Master cache: kinopub master URLs are signed per file and live ~30 min;
+  // the diagnostic dump and the subtitle attach share one download.
+  var kpMasterCache    = {};
+  var kpMasterInflight = {};
+  var KP_MASTER_CACHE_MS = 10 * 60 * 1000;
+
+  function kpFetchMaster(url, cb) {
+    var c = kpMasterCache[url];
+    if (c && (Date.now() - c.t) < KP_MASTER_CACHE_MS) { cb(null, c.body, 200); return; }
+    if (kpMasterInflight[url]) { kpMasterInflight[url].push(cb); return; }
+    kpMasterInflight[url] = [cb];
+    kpFetchText(url, 8000, function (err, body, status) {
+      if (!err) {
+        var keys = Object.keys(kpMasterCache);
+        if (keys.length > 40) kpMasterCache = {};
+        kpMasterCache[url] = { t: Date.now(), body: body };
+      }
+      var list = kpMasterInflight[url] || [];
+      delete kpMasterInflight[url];
+      for (var i = 0; i < list.length; i++) {
+        try { list[i](err, body, status); } catch (e) { Logger.warn('subs', 'master cb threw', String(e)); }
+      }
+    });
+  }
+
+  /**
+   * Pull SUBTITLES renditions out of a master. Prefers the subtitle group
+   * referenced by the highest-bandwidth stream-inf (kinopub uses one group
+   * "sub" for all variants anyway). URIs are absolutized against the master.
+   */
+  function kpExtractHlsSubs(masterUrl, text) {
+    var parsed = parseHls4Master(text || '');
+    var best = null;
+    for (var si = 0; si < parsed.streamInfs.length; si++) {
+      var s = parsed.streamInfs[si];
+      if (!best || s.bandwidth > best.bandwidth) best = s;
+    }
+    var groups  = parsed.subtitlesGroups || {};
+    var entries = [];
+    if (best && best.subsGroup && groups[best.subsGroup]) {
+      entries = groups[best.subsGroup];
+    } else {
+      for (var g in groups) if (groups.hasOwnProperty(g)) entries = entries.concat(groups[g]);
+    }
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      if (!e.uri) continue;
+      var abs = kpResolveUrl(masterUrl, e.uri);
+      if (seen[abs]) continue;
+      seen[abs] = true;
+      out.push({
+        name:   e.name || '',
+        lang:   e.lang || '',
+        uri:    abs,
+        forced: !!(e.attrs && e.attrs.FORCED === 'YES'),
+        deflt:  !!e.deflt,
+        order:  out.length
+      });
+    }
+    var audioCount = 0;
+    for (var ag in parsed.audioGroups) if (parsed.audioGroups.hasOwnProperty(ag)) audioCount += parsed.audioGroups[ag].length;
+    return { list: out, audioRenditions: audioCount, streamInfs: parsed.streamInfs.length, groups: Object.keys(groups).length };
+  }
+
+  var KP_LANG_RU = {
+    rus: 'Русские', eng: 'Английские', ukr: 'Украинские', jpn: 'Японские', fre: 'Французские', fra: 'Французские',
+    ger: 'Немецкие', deu: 'Немецкие', spa: 'Испанские', ita: 'Итальянские', por: 'Португальские', kor: 'Корейские',
+    chi: 'Китайские', zho: 'Китайские', tur: 'Турецкие', ara: 'Арабские', pol: 'Польские', cze: 'Чешские', ces: 'Чешские',
+    heb: 'Иврит', hun: 'Венгерские', dut: 'Голландские', nld: 'Голландские', swe: 'Шведские', nor: 'Норвежские',
+    dan: 'Датские', fin: 'Финские', gre: 'Греческие', ell: 'Греческие', tha: 'Тайские', vie: 'Вьетнамские',
+    ind: 'Индонезийские', rum: 'Румынские', ron: 'Румынские', bul: 'Болгарские', srp: 'Сербские', hrv: 'Хорватские',
+    kaz: 'Казахские', bel: 'Белорусские', lav: 'Латышские', lit: 'Литовские', est: 'Эстонские', hin: 'Хинди',
+    per: 'Персидские', fas: 'Персидские', may: 'Малайские', msa: 'Малайские', slv: 'Словенские', slo: 'Словацкие', slk: 'Словацкие'
+  };
+
+  /**
+   * Menu label. Lampa's Option.normalName() strips "^digits." and " #NN",
+   * so we avoid both: "Русские 01", "Английские 04", "ENG 04 (forced)".
+   * The number is kinopub's own rendition number (matches the website).
+   */
+  function kpSubLabel(h, i) {
+    var lang = String(h.lang || '').toLowerCase();
+    var isRu = false;
+    try { isRu = (Lampa.Storage.get('language', 'ru') === 'ru'); } catch (e) {}
+    var base = (isRu && KP_LANG_RU[lang]) ? KP_LANG_RU[lang] : (lang ? lang.toUpperCase() : 'SUB');
+    var num = '';
+    var m = String(h.name || '').match(/#\s*(\d+)/);
+    if (m) num = m[1];
+    else num = ((i + 1) < 10 ? '0' : '') + (i + 1);
+    var label = base + ' ' + num;
+    if (h.forced) label += ' (forced)';
+    return label;
+  }
+
+  /* ── Renderer: fetch rendition playlist → WebVTT segments → cues → DOM ── */
+
+  var KpSubs = (function () {
+    var active   = null;   // current item (see kpBuildSubItems)
+    var cues     = [];     // {s, e, t} sorted by s
+    var seq      = 0;      // load generation — bumps on every select/reset
+    var lastText = null;
+    var lastIdx  = 0;
+
+    function inner() { return $('.player-video__subtitles > div'); }
+
+    function draw(text) {
+      if (text === lastText) return;
+      lastText = text;
+      var el = inner();
+      if (!el.length) return;
+      el.html(text ? text : '&nbsp;').css({ display: text ? 'inline-block' : 'none' });
+      if (text) {
+        try {
+          var box = $('.player-video__subtitles');
+          if (box.hasClass('hide')) Lampa.PlayerVideo.subsview(true);
+        } catch (e) {}
+      }
+    }
+
+    // "hh:mm:ss.mmm" | "mm:ss.mmm" | srt comma variant → seconds
+    function parseTime(s) {
+      var m = String(s || '').replace(/^\s+|\s+$/g, '').match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})$/);
+      if (!m) return NaN;
+      var ms = parseInt((m[4] + '00').substring(0, 3), 10);
+      return (parseInt(m[1] || '0', 10) * 3600) + (parseInt(m[2], 10) * 60) + parseInt(m[3], 10) + ms / 1000;
+    }
+
+    function cleanText(t) {
+      return String(t || '')
+        .replace(/<\/?(c|v|ruby|rt|lang)[^>]*>/gi, '')
+        .replace(/<\d{1,2}:\d{2}[^>]*>/g, '')
+        .replace(/\{\\an\d\}/g, '')
+        .replace(/<(?!\/?(b|i|u)\s*>)[^>]*>/gi, '')
+        .replace(/^\s+|\s+$/g, '')
+        .replace(/\n/g, '<br>');
+    }
+
+    /**
+     * Parse one WebVTT/SRT body into cues. `seg` (optional) is the playlist
+     * segment {start, dur} used to pick the timestamp base:
+     *   raw      — cue times already absolute (typical VOD packagers)
+     *   tsmap    — apply X-TIMESTAMP-MAP (MPEGTS/90000 - LOCAL)
+     *   relative — cue times relative to the segment start
+     * Returns { cues, strategy, offset }.
+     */
+    function parseCues(text, seg) {
+      text = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+      var tsOffset = 0;
+      var tm = text.match(/X-TIMESTAMP-MAP=([^\n]+)/);
+      if (tm) {
+        var loc = tm[1].match(/LOCAL:([\d:.]+)/);
+        var mpg = tm[1].match(/MPEGTS:(\d+)/);
+        if (loc && mpg) {
+          var l = parseTime(loc[1]);
+          if (!isNaN(l)) tsOffset = (parseInt(mpg[1], 10) / 90000) - l;
+        }
+      }
+      var lines = text.split('\n');
+      var raw = [];
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var idx = line.indexOf('-->');
+        if (idx < 0) continue;
+        var a = parseTime(line.substring(0, idx));
+        var b = parseTime(line.substring(idx + 3).replace(/^\s+/, '').split(/\s+/)[0]);
+        if (isNaN(a) || isNaN(b)) continue;
+        var buf = [];
+        var j = i + 1;
+        for (; j < lines.length && lines[j].replace(/^\s+|\s+$/g, '') !== ''; j++) buf.push(lines[j]);
+        i = j;
+        raw.push({ s: a, e: b, t: cleanText(buf.join('\n')) });
+      }
+      var strategy = 'raw';
+      var offset = 0;
+      if (seg && raw.length) {
+        // Score each candidate base by how many cue starts land inside the
+        // segment window; ties keep the earlier (safer) candidate. Using all
+        // cues, not just the first, survives long cues that overlap from the
+        // previous segment (kinopub repeats boundary cues in both segments).
+        var lo = seg.start - 5;
+        var hi = seg.start + (seg.dur || 0) + 5;
+        var cands = [{ name: 'raw', off: 0 }];
+        if (tm) cands.push({ name: 'tsmap', off: tsOffset });
+        cands.push({ name: 'relative', off: seg.start });
+        var bestScore = -1;
+        for (var ci = 0; ci < cands.length; ci++) {
+          var score = 0;
+          for (var ri = 0; ri < raw.length; ri++) {
+            var st = raw[ri].s + cands[ci].off;
+            if (st >= lo && st <= hi) score++;
+          }
+          if (score > bestScore) { bestScore = score; strategy = cands[ci].name; offset = cands[ci].off; }
+        }
+      }
+      var out = [];
+      for (var k = 0; k < raw.length; k++) {
+        if (!raw[k].t) continue;
+        out.push({ s: raw[k].s + offset, e: raw[k].e + offset, t: raw[k].t });
+      }
+      return { cues: out, strategy: strategy, offset: offset };
+    }
+
+    function parsePlaylist(text, baseUrl) {
+      var lines = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+      var segs = [];
+      var dur = 0;
+      var t = 0;
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].replace(/^\s+|\s+$/g, '');
+        if (!l) continue;
+        if (l.indexOf('#EXTINF:') === 0) { dur = parseFloat(l.substring(8)) || 0; continue; }
+        if (l.charAt(0) === '#') continue;
+        segs.push({ url: kpResolveUrl(baseUrl, l), start: t, dur: dur });
+        t += dur;
+        dur = 0;
+      }
+      return segs;
+    }
+
+    function merge(list) {
+      if (!list.length) return;
+      var seen = {};
+      for (var i = 0; i < cues.length; i++) seen[cues[i].s + '|' + cues[i].e + '|' + cues[i].t] = 1;
+      for (var k = 0; k < list.length; k++) {
+        var key = list[k].s + '|' + list[k].e + '|' + list[k].t;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        cues.push(list[k]);
+      }
+      cues.sort(function (a, b) { return a.s - b.s; });
+      lastIdx = 0;
+    }
+
+    function currentTime() {
+      try { return Lampa.PlayerVideo.video().currentTime || 0; } catch (e) { return 0; }
+    }
+
+    function loadSegments(segs, gen, src) {
+      var cur = currentTime();
+      var startIdx = 0;
+      for (var i = 0; i < segs.length; i++) if (segs[i].start <= cur) startIdx = i;
+      // Fetch order: from the current position to the end, then the beginning.
+      var order = [];
+      for (i = startIdx; i < segs.length; i++) order.push(i);
+      for (i = 0; i < startIdx; i++) order.push(i);
+      var CONC = 4;
+      var next = 0, running = 0, doneCount = 0, failed = 0, logged = false;
+      var t0 = Date.now();
+      function pump() {
+        while (running < CONC && next < order.length) {
+          (function (si) {
+            running++;
+            var seg = segs[si];
+            kpFetchText(seg.url, 10000, function (err, body, status) {
+              running--;
+              if (gen !== seq) return;
+              doneCount++;
+              if (err) {
+                failed++;
+                if (failed <= 3) Logger.warn('subs', 'segment fetch failed', { err: err, status: status, url: seg.url });
+              } else {
+                var r = parseCues(body, seg);
+                if (!logged) {
+                  logged = true;
+                  Logger.info('subs', 'first segment parsed', {
+                    idx: si, cues: r.cues.length, strategy: r.strategy, offset: r.offset,
+                    segStart: seg.start, segDur: seg.dur, firstCue: r.cues[0] ? r.cues[0].s : null,
+                    sample: body.substring(0, 160)
+                  });
+                  kpDiagNote('subs_first_segment', 'cues=' + r.cues.length + ' strategy=' + r.strategy + ' seg=' + si + '/' + segs.length);
+                }
+                merge(r.cues);
+              }
+              if (doneCount >= order.length) {
+                src.cues = cues;
+                Logger.info('subs', 'track loaded', { segments: segs.length, failed: failed, cues: cues.length, ms: Date.now() - t0 });
+                kpDiagNote('subs_loaded', 'cues=' + cues.length + ' segments=' + segs.length + ' failed=' + failed + ' ms=' + (Date.now() - t0));
+                if (kpDiagOn()) { try { Lampa.Noty.show('KP subs: ' + cues.length + ' cues / ' + segs.length + ' seg' + (failed ? ' / ' + failed + ' err' : '')); } catch (e) {} }
+              } else pump();
+            });
+          })(order[next++]);
+        }
+      }
+      pump();
+    }
+
+    function select(item) {
+      var gen = ++seq;
+      active = item;
+      cues = [];
+      lastIdx = 0;
+      draw('');
+      var src = item && item.kp_src;
+      if (!src || !src.uri) return;
+      if (src.cues) { cues = src.cues; return; }   // already fetched this session
+      Logger.info('subs', 'select', { label: item.label, uri: src.uri });
+      kpFetchText(src.uri, 10000, function (err, body, status) {
+        if (gen !== seq) return;
+        if (err) {
+          Logger.warn('subs', 'track fetch failed', { err: err, status: status, uri: src.uri });
+          kpDiagNote('subs_track_error', err + ' status=' + status + ' host=' + kpUrlHost(src.uri));
+          try { Lampa.Noty.show(Lampa.Lang.translate('kp_subs_error') + ' (' + err + ')'); } catch (e) {}
+          return;
+        }
+        var head = String(body || '').replace(/^\uFEFF/, '').substring(0, 12);
+        if (head.indexOf('#EXTM3U') !== 0) {
+          // A plain .vtt/.srt file (kinopub API urls, or a CDN that serves
+          // the text directly) — parse as-is.
+          var r = parseCues(body, null);
+          cues = r.cues;
+          src.cues = cues;
+          Logger.info('subs', 'direct text loaded', { cues: cues.length, bytes: body.length });
+          kpDiagNote('subs_loaded', 'direct cues=' + cues.length);
+          return;
+        }
+        if (body.indexOf('#EXT-X-STREAM-INF') >= 0) {
+          Logger.warn('subs', 'rendition URI is a master playlist, unsupported', { uri: src.uri });
+          kpDiagNote('subs_track_error', 'rendition is a master playlist');
+          return;
+        }
+        var segs = parsePlaylist(body, src.uri);
+        Logger.info('subs', 'rendition playlist', {
+          segments: segs.length,
+          first: segs[0] ? segs[0].url : null,
+          totalDur: segs.length ? Math.round(segs[segs.length - 1].start + segs[segs.length - 1].dur) : 0,
+          head: body.substring(0, 200)
+        });
+        kpDiagNote('subs_playlist', 'segments=' + segs.length + (segs[0] ? ' first=' + segs[0].url.replace(/\?.*$/, '').slice(-60) : ''));
+        if (!segs.length) return;
+        loadSegments(segs, gen, src);
+      });
+    }
+
+    function deselect() {
+      seq++;
+      active = null;
+      cues = [];
+      lastIdx = 0;
+      draw('');
+    }
+
+    function update(t) {
+      if (!active || typeof t !== 'number' || isNaN(t)) return;
+      var shift = 0;
+      try { shift = parseInt(Lampa.Storage.get('player_subs_shift_time', '0'), 10) || 0; } catch (e) {}
+      t = t - shift;
+      var text = '';
+      var n = cues.length;
+      if (n) {
+        if (lastIdx >= n || cues[lastIdx].s > t) lastIdx = 0;
+        for (var i = lastIdx; i < n; i++) {
+          var c = cues[i];
+          if (c.s > t) break;
+          lastIdx = i;
+          if (t < c.e) { text = c.t; break; }
+        }
+      }
+      draw(text);
+    }
+
+    function reset() {
+      deselect();
+      lastText = null;
+    }
+
+    return {
+      select:   select,
+      deselect: deselect,
+      update:   update,
+      reset:    reset,
+      isActive: function (item) { return !!active && active === item; },
+      // exposed for offline tests (smoke-test.js) — not used at runtime
+      parseCues:     parseCues,
+      parsePlaylist: parsePlaylist,
+      active:   function () { return active; }
+    };
+  })();
+
+  /* ── Track list objects handed to Lampa's panel ─────────────────────── */
+
+  var kpSubItems  = null;   // current list (also assigned to video.customSubs)
+  var kpSubsLast  = null;   // remembered choice {label} for playlist next/prev
+
+  function kpBuildSubItems(hlsList, apiList) {
+    var items = [];
+    function add(label, src) {
+      var item = { index: items.length, label: label, selected: false, ready: true, kp_src: src };
+      // `ready: true` stops Lampa's Subtitles.custom() from attaching its own
+      // .srt loader; our accessor drives the renderer instead. Lampa's panel
+      // sets mode='showing' / 'disabled' and toggles `selected`.
+      Object.defineProperty(item, 'mode', {
+        configurable: true,
+        enumerable:   false,
+        get: function () { return KpSubs.isActive(item) ? 'showing' : 'disabled'; },
+        set: function (v) {
+          if (v === 'showing') {
+            item.selected = true;
+            kpSubsLast = { label: item.label };
+            KpSubs.select(item);
+          } else if (KpSubs.isActive(item)) {
+            KpSubs.deselect();
+          }
+        }
+      });
+      items.push(item);
+    }
+    for (var i = 0; i < hlsList.length; i++) {
+      add(kpSubLabel(hlsList[i], i), { uri: hlsList[i].uri, hls: true });
+    }
+    if (!hlsList.length) {
+      for (var j = 0; j < apiList.length; j++) {
+        if (apiList[j] && apiList[j].url) add(apiList[j].label || ('sub ' + (j + 1)), { uri: apiList[j].url, hls: false });
+      }
+    }
+    return items;
+  }
+
+  function kpInstallSubItems(items, data) {
+    kpSubItems = items;
+    kpReattachSubItems();
+    try { Lampa.PlayerVideo.listener.send('subs', { subs: items }); }
+    catch (e) { Logger.warn('subs', 'subs event failed', String(e)); }
+    // Restore the choice across playlist navigation (Lampa's own
+    // saveParams/setParams only works when the list exists before
+    // loadeddata — ours arrives asynchronously).
+    var pick = null;
+    if (data && data.continue_play && kpSubsLast) {
+      for (var i = 0; i < items.length; i++) if (items[i].label === kpSubsLast.label) { pick = items[i]; break; }
+    }
+    var subsStart = false;
+    try { subsStart = !!Lampa.Storage.field('subtitles_start'); } catch (e) {}
+    if (!pick && subsStart && !(data && data.continue_play)) pick = items[0];
+    if (pick && !KpSubs.active()) {
+      for (var k = 0; k < items.length; k++) items[k].selected = false;
+      pick.mode = 'showing';
+      try { Lampa.PlayerVideo.subsview(true); } catch (e) {}
+      Logger.info('subs', 'auto-selected', { label: pick.label, reason: data && data.continue_play ? 'playlist' : 'subtitles_start' });
+    }
+  }
+
+  // Runs on PlayerVideo 'loadeddata' (before Lampa's loaded()) and right after
+  // install: keeps our list as video.customSubs on whatever video object is
+  // current, so Lampa announces OUR list rather than an empty one.
+  function kpReattachSubItems() {
+    if (!kpSubItems) return;
+    try {
+      var v = Lampa.PlayerVideo.video();
+      if (v && v.customSubs !== kpSubItems) v.customSubs = kpSubItems;
+    } catch (e) {}
+  }
+
+  /* ── Diagnostics ────────────────────────────────────────────────────── */
+
+  var kpDiag = { last: null, t0: 0 };
+
+  function kpDiagBegin(data) {
+    var ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    var tz = ua.match(/Tizen\s+([\d.]+)/i);
+    kpDiag.t0 = Date.now();
+    kpDiag.last = {
+      when:     new Date().toISOString(),
+      plugin:   PLUGIN_VERSION,
+      lampa:    (Lampa.Manifest && (Lampa.Manifest.app_version || Lampa.Manifest.app_digital)) || '?',
+      platform: (function () { try { return Lampa.Platform.get() || 'browser'; } catch (e) { return '?'; } })(),
+      tizen:    tz ? tz[1] : '',
+      chrome:   (ua.match(/Chrome\/(\d+)/) || [])[1] || '',
+      player:   detectActualPlayer() || '(default)',
+      hlsMethod: (function () { try { return Lampa.Storage.field('player_hls_method'); } catch (e) { return '?'; } })(),
+      proxy:    (kpProxyAvailable === true ? 'up' : kpProxyAvailable === false ? 'down' : 'unknown') + (kpProxyVersion ? ' v' + kpProxyVersion : ''),
+      setting:  kpSubsMode(),
+      mode:     kpSubsModeResolved(),
+      title:    (data && data.title) || '',
+      playUrl:  (data && data.url) ? String(data.url).slice(0, 120) : '',
+      master:   (data && data._kp && data._kp.subsMaster) ? String(data._kp.subsMaster).slice(0, 120) : '',
+      apiSubs:  (data && data._kp && data._kp.apiSubs) ? data._kp.apiSubs.map(function (s) { return s.label + ' @' + kpUrlHost(s.url); }) : [],
+      hlsSubs:  [],
+      events:   []
+    };
+  }
+
+  function kpDiagNote(key, val) {
+    if (!kpDiag.last) return;
+    kpDiag.last.events.push({ t: Date.now() - kpDiag.t0, k: key, v: val });
+    if (kpDiag.last.events.length > 60) kpDiag.last.events.shift();
+    Logger.info('diag', key, val);
+  }
+
+  function kpDiagText() {
+    var d = kpDiag.last;
+    if (!d) return Lampa.Lang.translate('kp_diag_empty');
+    var L = [];
+    L.push('kp.js ' + d.plugin + ' / Lampa ' + d.lampa + ' / ' + d.platform + (d.tizen ? ' Tizen ' + d.tizen : '') + (d.chrome ? ' Chrome ' + d.chrome : ''));
+    L.push('player=' + d.player + ' hls_method=' + d.hlsMethod + ' proxy=' + d.proxy);
+    L.push('subs setting=' + d.setting + ' → mode=' + d.mode);
+    L.push('title: ' + d.title);
+    L.push('play url: ' + d.playUrl);
+    L.push('subs master: ' + d.master);
+    L.push('API subtitles[]: ' + d.apiSubs.length + (d.apiSubs.length ? ' → ' + d.apiSubs.join(', ') : ''));
+    L.push('HLS SUBTITLES renditions: ' + d.hlsSubs.length + (d.hlsSubs.length ? ' → ' + d.hlsSubs.join(', ') : ''));
+    L.push('--- events (ms since start) ---');
+    for (var i = 0; i < d.events.length; i++) L.push('+' + d.events[i].t + ' ' + d.events[i].k + ': ' + d.events[i].v);
+    return L.join('\n');
+  }
+
+  function kpDiagShow() {
+    var text = kpDiagText();
+    Logger.info('diag', 'report', { text: text });
+    var prev = 'settings_component';
+    try { prev = (Lampa.Controller.enabled() || {}).name || prev; } catch (e) {}
+    var html = $('<div class="about"><div style="white-space:pre-wrap;word-break:break-all;font-size:1.05em;line-height:1.4"></div></div>');
+    html.find('div').text(text);
+    try {
+      Lampa.Modal.open({
+        title: Lampa.Lang.translate('kp_action_diag'),
+        html:  html,
+        size:  'large',
+        onBack: function () {
+          Lampa.Modal.close();
+          Lampa.Controller.toggle(prev);
+        }
+      });
+    } catch (e) {
+      Lampa.Noty.show(text.split('\n').slice(0, 8).join('<br>'));
+    }
+  }
+
+  /* ── Player lifecycle hooks ─────────────────────────────────────────── */
+
+  var kpSubsAttachGen = 0;
+
+  function kpOnPlayerStart(data) {
+    kpSubsAttachGen++;
+    KpSubs.reset();
+    kpSubItems = null;
+    kpDiagBegin(data);
+    if (!data || !data._kp) { kpDiagNote('subs', 'not a kinopub play element'); return; }
+    var mode = kpSubsModeResolved();
+    var gen  = kpSubsAttachGen;
+    var master = data._kp.subsMaster || data._kp.master;
+    kpDiagNote('subs_mode', mode + ' (setting ' + kpSubsMode() + ')');
+    if (mode === 'off') return;
+    if (mode === 'api') { kpDiagNote('subs_api', 'play.subtitles=' + ((data.subtitles && data.subtitles.length) || 0)); return; }
+    if (!master) { kpDiagNote('subs', 'no master url'); return; }
+
+    kpFetchMaster(master, function (err, body, status) {
+      if (gen !== kpSubsAttachGen) return; // player moved to another item
+      var hls = [];
+      if (err) {
+        Logger.warn('subs', 'master fetch failed', { err: err, status: status, host: kpUrlHost(master) });
+        kpDiagNote('subs_master_error', err + ' status=' + status + ' host=' + kpUrlHost(master));
+      } else {
+        var ex = kpExtractHlsSubs(master, body);
+        hls = ex.list;
+        kpDiag.last.hlsSubs = hls.map(function (h, i) { return kpSubLabel(h, i); });
+        Logger.info('subs', 'master parsed', {
+          host: kpUrlHost(master), bytes: body.length,
+          subtitleRenditions: hls.length, audioRenditions: ex.audioRenditions, streamInfs: ex.streamInfs,
+          names: hls.map(function (h) { return h.name; }),
+          sampleUri: hls[0] ? hls[0].uri : null
+        });
+        kpDiagNote('subs_master', 'renditions=' + hls.length + ' audio=' + ex.audioRenditions + ' bytes=' + body.length);
+      }
+      var api = data._kp.apiSubs || [];
+      if (kpDiagOn()) {
+        try { Lampa.Noty.show('KP субтитры: API ' + api.length + ' · HLS ' + hls.length + ' · режим ' + mode); } catch (e) {}
+        // Variant D check: does /v1/items/media-links list more subtitles
+        // than the item payload? Logged only, never used for playback.
+        if (data._kp.mediaId) {
+          try {
+            KP.mediaLinks(new Lampa.Reguest(), data._kp.mediaId, function (j) {
+              var subs = (j && j.subtitles) || [];
+              kpDiagNote('api_media_links', 'subtitles=' + subs.length + (subs.length ? ' → ' + subs.map(function (s) { return (s.lang || '?') + (s.forced ? '/forced' : '') + (s.embed ? '/embed' : ''); }).join(',') : ''));
+              Logger.info('subs', 'media-links', { mid: data._kp.mediaId, subtitles: subs.map(function (s) { return { lang: s.lang, embed: s.embed, forced: s.forced, file: s.file, host: kpUrlHost(s.url) }; }) });
+            }, function (xhr, status) {
+              kpDiagNote('api_media_links', 'error http=' + (xhr && xhr.status) + ' ' + status);
+            });
+          } catch (e) {}
+        }
+      }
+      if (mode === 'native') {
+        // AVPlay (via proxy subs=1) lists the TEXT tracks itself; we only
+        // supply readable names — Lampa maps translates.subs[track_num].
+        try {
+          if (Lampa.PlayerPanel && typeof Lampa.PlayerPanel.updateTranslate === 'function') {
+            Lampa.PlayerPanel.updateTranslate('subs', hls.map(function (h, i) { return { label: kpSubLabel(h, i) }; }));
+          }
+        } catch (e) {}
+        kpDiagNote('subs_native', 'names pushed=' + hls.length);
+        return;
+      }
+      var items = kpBuildSubItems(hls, api);
+      if (!items.length) { kpDiagNote('subs_list', 'empty (no HLS renditions, no API subs)'); return; }
+      kpDiagNote('subs_list', items.length + ' tracks (' + (hls.length ? 'hls' : 'api') + ')');
+      kpInstallSubItems(items, data);
+    });
+  }
+
+  function kpOnPlayerReady(data) {
+    // Tizen-only: log the first native subtitle events so the report shows
+    // whether AVPlay actually renders a TEXT track (native mode).
+    try {
+      var v = Lampa.PlayerVideo.video();
+      if (v && typeof v.addEventListener === 'function' && Lampa.Platform.is('tizen')) {
+        var n = 0;
+        v.addEventListener('subtitle', function (e) {
+          n++;
+          if (n <= 3) kpDiagNote('avplay_subtitle_event', String((e && e.text) || '').slice(0, 60));
+        });
+      }
+    } catch (e) {}
+  }
+
+  function kpOnPlayerDestroy() {
+    kpSubsAttachGen++;
+    KpSubs.reset();
+    kpSubItems = null;
   }
 
   function applyVoiceTrack(idx) {
@@ -2503,6 +3259,7 @@
         extract.type = 'movie';
         var v = item.videos[0];
         extract.movie = {
+          id:        v.id,
           files:     parseFiles(v.files),
           audios:    v.audios || [],
           subtitles: v.subtitles || []
@@ -2595,7 +3352,7 @@
         return season.episodes.map(function (ep) {
           var stream = pickStream(ep.files, fmt);
           return {
-            kp:           { kind: 'episode', files: ep.files, audios: ep.audios, subtitles: ep.subtitles },
+            kp:           { kind: 'episode', id: ep.id, files: ep.files, audios: ep.audios, subtitles: ep.subtitles },
             episode:      ep.number,
             season:       season.number,
             // display title for the in-source episode list (filmix-style)
@@ -2616,7 +3373,7 @@
       } else if (extract.type === 'movie' && extract.movie) {
         var stream2 = pickStream(extract.movie.files, fmt);
         return [{
-          kp:          { kind: 'movie', files: extract.movie.files, audios: extract.movie.audios, subtitles: extract.movie.subtitles },
+          kp:          { kind: 'movie', id: extract.movie.id, files: extract.movie.files, audios: extract.movie.audios, subtitles: extract.movie.subtitles },
           title:       (object.movie && (object.movie.title || object.movie.name)) || '',
           quality:     stream2 ? (stream2.currentQuality + 'p ') : '',
           translation: 1,
@@ -2797,13 +3554,41 @@
         }
       }
 
+      // ── Subtitles (v1.0.74) ────────────────────────────────────────────
+      // Everything the async subtitle attach (kpOnPlayerStart, fired on
+      // Lampa.Player 'start') needs is stashed on the play element itself,
+      // so playlist next/prev/auto-next episodes get their subtitles too.
+      //   master     — the URL the player will open (before proxy wrapping)
+      //   subsMaster — HLS4 master of the same file: it carries ALL
+      //                EXT-X-MEDIA:TYPE=SUBTITLES renditions (HLS2/TS masters
+      //                and the proxy-reduced master don't)
+      //   apiSubs    — kinopub API subtitles[] (.srt/.vtt), usually 0-3 entries
       var subsAttached = 0;
-      var subsEnabled  = Lampa.Storage.get(KEY_SUBS, false);
-      if (subsEnabled) {
-        var subs = buildSubtitles(element.kp.subtitles);
-        if (subs.length) {
-          play.subtitles = subs;
-          subsAttached = subs.length;
+      var subsMode     = kpSubsModeResolved();
+      var subsMaster   = stream.url;
+      try {
+        var kfiles = element.kp.files || [];
+        for (var kfi = 0; kfi < kfiles.length; kfi++) {
+          if (kfiles[kfi].quality === stream.currentQuality && kfiles[kfi].urls && kfiles[kfi].urls.hls4) {
+            subsMaster = kfiles[kfi].urls.hls4;
+            break;
+          }
+        }
+      } catch (e) {}
+      play._kp = {
+        master:     stream.url,
+        subsMaster: subsMaster,
+        apiSubs:    buildSubtitles(element.kp.subtitles),
+        kind:       element.kp.kind,
+        mediaId:    element.kp.id || null
+      };
+      if (subsMode === 'api') {
+        // Legacy v1.0.x behaviour: hand kinopub API subtitle URLs to Lampa as
+        // play.subtitles. NOTE: presence of play.subtitles makes Lampa ignore
+        // embedded text tracks (PlayerVideo.loaded(): customSubs || textTracks).
+        if (play._kp.apiSubs.length) {
+          play.subtitles = play._kp.apiSubs;
+          subsAttached = play.subtitles.length;
         }
       }
 
@@ -3968,10 +4753,37 @@
       field: { name: Lampa.Lang.translate('kp_set_proxy'), description: Lampa.Lang.translate('kp_set_proxy_descr') }
     });
 
+    // v1.0.74: subtitle source mode (replaces the v1.0.x "external subtitles"
+    // trigger — that behaviour is now the 'api' mode).
+    if (Lampa.Storage.get(KEY_SUBS_MODE, '') === '') Lampa.Storage.set(KEY_SUBS_MODE, 'auto');
     Lampa.SettingsApi.addParam({
       component: 'kp',
-      param: { name: KEY_SUBS, type: 'trigger', "default": false },
-      field: { name: Lampa.Lang.translate('kp_set_subs'), description: Lampa.Lang.translate('kp_set_subs_descr') }
+      param: {
+        name: KEY_SUBS_MODE, type: 'select',
+        values: {
+          'auto':   Lampa.Lang.translate('kp_subs_mode_auto'),
+          'hls':    Lampa.Lang.translate('kp_subs_mode_hls'),
+          'native': Lampa.Lang.translate('kp_subs_mode_native'),
+          'api':    Lampa.Lang.translate('kp_subs_mode_api'),
+          'off':    Lampa.Lang.translate('kp_subs_mode_off')
+        },
+        "default": 'auto'
+      },
+      field: { name: Lampa.Lang.translate('kp_set_subs_mode'), description: Lampa.Lang.translate('kp_set_subs_mode_descr') },
+      onChange: function (v) { Logger.info('subs', 'mode changed', { mode: v }); }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
+      param: { name: KEY_DIAG, type: 'trigger', "default": false },
+      field: { name: Lampa.Lang.translate('kp_set_diag'), description: Lampa.Lang.translate('kp_set_diag_descr') }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
+      param: { name: 'kp_action_diag', type: 'trigger', "default": false },
+      field: { name: Lampa.Lang.translate('kp_action_diag'), description: Lampa.Lang.translate('kp_action_diag_descr') },
+      onChange: function () { kpDiagShow(); }
     });
 
     Lampa.SettingsApi.addParam({
@@ -4161,6 +4973,51 @@
         en: 'Attach kinopub .vtt subtitle URLs to the player. If playback hangs — turn off.',
         ua: 'Передавати плеєру URL субтитрів kinopub. Якщо плеєр зависає - вимкніть.'
       },
+      kp_set_subs_mode: {
+        ru: 'Субтитры',
+        en: 'Subtitles',
+        ua: 'Субтитри'
+      },
+      kp_set_subs_mode_descr: {
+        ru: 'Откуда брать список субтитров. Авто = все дорожки из HLS-манифеста kinopub (как на сайте), отрисовка плагином — работает на Samsung/LG/браузере. Через плеер ТВ = дорожки остаются в манифесте, их показывает сам плеер (нужен manifest-proxy 1.2+). Только API = старое поведение (2-3 внешних .srt).',
+        en: 'Where the subtitle list comes from. Auto = every rendition from the kinopub HLS manifest (same as the website), drawn by the plugin. Via TV player = renditions stay in the manifest and the TV player lists them (needs manifest-proxy 1.2+). API only = legacy behaviour (2-3 external .srt).',
+        ua: 'Звідки брати список субтитрів. Авто = усі доріжки з HLS-маніфесту kinopub, малює плагін. Через плеєр ТВ = доріжки лишаються у маніфесті (потрібен manifest-proxy 1.2+). Лише API = стара поведінка.'
+      },
+      kp_subs_mode_auto:   { ru: 'Авто (все из HLS, рендер плагина)', en: 'Auto (all from HLS, plugin render)', ua: 'Авто (усі з HLS)' },
+      kp_subs_mode_hls:    { ru: 'Все из HLS (рендер плагина)',        en: 'All from HLS (plugin render)',        ua: 'Усі з HLS (плагін)' },
+      kp_subs_mode_native: { ru: 'Через плеер ТВ (proxy 1.2+)',        en: 'Via TV player (proxy 1.2+)',          ua: 'Через плеєр ТВ (proxy 1.2+)' },
+      kp_subs_mode_api:    { ru: 'Только API kinopub (старое)',        en: 'kinopub API only (legacy)',           ua: 'Лише API kinopub' },
+      kp_subs_mode_off:    { ru: 'Выключены',                          en: 'Off',                                 ua: 'Вимкнено' },
+      kp_set_diag: {
+        ru: 'Диагностика субтитров',
+        en: 'Subtitle diagnostics',
+        ua: 'Діагностика субтитрів'
+      },
+      kp_set_diag_descr: {
+        ru: 'Показывать всплывающие сообщения о найденных дорожках и писать подробный лог (API vs HLS vs плеер). Выключите после проверки.',
+        en: 'Show on-screen notices about detected tracks and write a verbose log (API vs HLS vs player). Turn off after testing.',
+        ua: 'Показувати повідомлення про знайдені доріжки та писати докладний лог. Вимкніть після перевірки.'
+      },
+      kp_action_diag: {
+        ru: 'Показать отчёт диагностики',
+        en: 'Show diagnostics report',
+        ua: 'Показати звіт діагностики'
+      },
+      kp_action_diag_descr: {
+        ru: 'Сводка по последнему запуску: платформа, плеер, режим, сколько субтитров отдал API, сколько в HLS-манифесте, что увидел плеер, ошибки загрузки.',
+        en: 'Summary of the last playback: platform, player, mode, subtitles from API vs HLS manifest vs player, load errors.',
+        ua: 'Зведення по останньому запуску: платформа, плеєр, режим, субтитри з API / HLS / плеєра, помилки.'
+      },
+      kp_diag_empty: {
+        ru: 'Пока нет данных — запустите любой фильм/серию через KinoPub и откройте отчёт снова.',
+        en: 'No data yet — play anything via KinoPub and open the report again.',
+        ua: 'Даних ще немає — запустіть щось через KinoPub і відкрийте звіт знову.'
+      },
+      kp_subs_error: {
+        ru: 'Субтитры: ошибка загрузки',
+        en: 'Subtitles: load error',
+        ua: 'Субтитри: помилка завантаження'
+      },
       kp_set_logout: {
         ru: 'Выйти из аккаунта',
         en: 'Logout',
@@ -4325,6 +5182,12 @@
           Lampa.Player.listener.follow('start',   function () { setupNextEpisodeLabelOverride(); });
           Lampa.Player.listener.follow('destroy', function () { cleanupNextEpisodeLabelOverride(); });
         }
+        // v1.0.74: subtitles — 'start' carries the play element (incl. our
+        // play._kp stash); 'ready' is when Lampa's own Subtitles.bind ran and
+        // the video object exists; 'destroy' resets renderer + diagnostics.
+        Lampa.Player.listener.follow('start',   function (e) { try { kpOnPlayerStart(e); }   catch (err) { Logger.warn('subs', 'onStart failed', String(err)); } });
+        Lampa.Player.listener.follow('ready',   function (e) { try { kpOnPlayerReady(e); }   catch (err) { Logger.warn('subs', 'onReady failed', String(err)); } });
+        Lampa.Player.listener.follow('destroy', function ()  { try { kpOnPlayerDestroy(); }  catch (err) { Logger.warn('subs', 'onDestroy failed', String(err)); } });
         // After the player closes, repaint chips on visible cards so episodes
         // that just gained timeline progress flip from green to faded immediately.
         // v1.0.33: also refresh the filter sidebar so the "Озвучка: ..." label
@@ -4384,6 +5247,27 @@
           dumpAvplayTracks('tracks-event');
         });
         Lampa.Player.listener.follow('destroy', function () { avplayDumped = false; });
+
+        // v1.0.74: subtitle renderer + diagnostics hooks.
+        //   timeupdate → draw the cue for the current position
+        //   loadeddata → runs BEFORE Lampa's PlayerVideo.loaded(); re-attach
+        //                our list as video.customSubs on the (possibly new,
+        //                after a voice soft-swap) video object so loaded()
+        //                re-announces OUR list instead of an empty one
+        //   subs       → record what Lampa's panel actually received
+        Lampa.PlayerVideo.listener.follow('timeupdate', function (e) {
+          try { KpSubs.update(e && e.current); } catch (err) {}
+        });
+        Lampa.PlayerVideo.listener.follow('loadeddata', function () {
+          try { kpReattachSubItems(); } catch (err) {}
+        });
+        Lampa.PlayerVideo.listener.follow('subs', function (e) {
+          try {
+            var n = (e && e.subs && e.subs.length) || 0;
+            var ours = !!(e && e.subs && kpSubItems && e.subs === kpSubItems);
+            kpDiagNote('lampa_subs_event', n + (ours ? ' (plugin list)' : ' (player list)'));
+          } catch (err) {}
+        });
 
         if (!KP_BARE_MODE) {
           // Voice track switching — fired when audio backend has read tracks
