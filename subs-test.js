@@ -133,9 +133,9 @@ ok(Object.keys(items[0]).indexOf('mode') === -1, 'mode accessor non-enumerable (
 ok(items[0].mode === 'disabled', 'mode getter');
 const apiOnly = T.kpBuildSubItems([], [{ label: 'api', url: 'https://x/a.srt' }]);
 ok(apiOnly.length === 1 && apiOnly[0].kp_src.uri === 'https://x/a.srt', 'API fallback when HLS empty');
-ok(T.kpSubsModeResolved() === 'hls', 'default mode resolves to hls');
+ok(T.kpSubsModeResolved() === 'auto', 'default mode stays auto (media-links first)');
 storage.kp_subs_mode = 'native';
-ok(T.kpSubsModeResolved() === 'hls', 'native without proxy 1.2 falls back to hls');
+ok(T.kpSubsModeResolved() === 'auto', 'native without proxy 1.2 falls back to auto');
 storage.kp_subs_mode = 'api';
 ok(T.kpSubsModeResolved() === 'api', 'api mode kept');
 

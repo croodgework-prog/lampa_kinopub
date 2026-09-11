@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.75';
+  var PLUGIN_VERSION  = '1.0.76';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -1423,8 +1423,7 @@
 
   function kpSubsModeResolved() {
     var m = kpSubsMode();
-    if (m === 'native' && !kpProxySupportsSubs()) return 'hls'; // proxy too old / absent
-    if (m === 'auto') return 'hls';
+    if (m === 'native' && !kpProxySupportsSubs()) return 'auto'; // proxy too old / absent
     return m;
   }
 
@@ -2146,6 +2145,7 @@
       });
     }
 
+    // 'hls' (forced) and 'native' read the master; 'auto' tries media-links first.
     if (mode === 'hls' || mode === 'native') { viaMaster(''); return; }
 
     // Step 1 (auto) — /v1/items/media-links: full subtitle list as direct
