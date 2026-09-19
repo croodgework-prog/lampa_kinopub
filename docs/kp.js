@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.78';
+  var PLUGIN_VERSION  = '1.0.79';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -86,8 +86,16 @@
   var CLIENT_ID       = 'xbmc';
   var CLIENT_SECRET   = 'cgg3gtifu46urtfp2zp1nqtba0k2ezxh';
 
-  var API_HOST        = 'https://api.service-kp.com';
-  var DEVICE_PAGE     = 'https://kino.pub/device';
+  // v1.0.79: kinopub API hosts. All resolve to the same backend (Lampac's
+  // list: api.srvkp.com "стандартный", api.service-kp.com "старый"). RU ISPs
+  // block them by SNI/IP unevenly, so on a network-level failure (timeout,
+  // status 0) the plugin hops to the next host and sticks with it.
+  var KP_API_HOSTS    = ['https://api.service-kp.com', 'https://api.srvkp.com'];
+  var kpApiHostIdx    = 0;
+  function API_BASE() { return KP_API_HOSTS[kpApiHostIdx]; }
+  var API_HOST        = KP_API_HOSTS[0]; // legacy name, still used for logging
+  var DEVICE_PAGE     = 'https://kino.watch/device'; // overwritten by verification_uri from /oauth2/device
+
 
   // Storage keys
   var KEY_TOKEN       = 'kp_token';
@@ -324,7 +332,21 @@
      * source can cancel pending kinopub requests on destroy/back. Falls back to
      * a temporary network when none provided (e.g. background profile check).
      */
-    function call(method, url, postData, headers, network, success, error, timeoutMs) {
+    function apiHostOf(url) {
+      for (var i = 0; i < KP_API_HOSTS.length; i++) {
+        if (String(url || '').indexOf(KP_API_HOSTS[i] + '/') === 0) return i;
+      }
+      return -1;
+    }
+
+    // Network-level failure = nothing came back at all (DNS/TCP/TLS/DPI drop or
+    // timeout). An HTTP status, even 5xx, means the host is reachable.
+    function isNetworkFailure(xhr, status) {
+      var code = xhr && xhr.status;
+      return !code || status === 'timeout' || status === 'error';
+    }
+
+    function call(method, url, postData, headers, network, success, error, timeoutMs, _hops) {
       var net = network || new Lampa.Reguest();
       net.timeout(timeoutMs || 15000);
 
@@ -334,18 +356,32 @@
       }
 
       var fullUrl = proxify(url);
+      var hops = _hops || 0;
+      var t0 = Date.now();
 
       // .silent(url, complite, error, post_data?, params?) — params.headers supported.
       net.silent(fullUrl, function (json) {
         success(json);
       }, function (xhr, status) {
+        var hostIdx = apiHostOf(url);
+        if (hostIdx >= 0 && isNetworkFailure(xhr, status) && hops < KP_API_HOSTS.length - 1) {
+          // v1.0.79: hop to the next API host and retry the same request once.
+          var nextIdx = (hostIdx + 1) % KP_API_HOSTS.length;
+          kpApiHostIdx = nextIdx;
+          var nextUrl = KP_API_HOSTS[nextIdx] + url.substring(KP_API_HOSTS[hostIdx].length);
+          Logger.warn('api', 'host unreachable, switching', {
+            from: KP_API_HOSTS[hostIdx], to: KP_API_HOSTS[nextIdx], status: status, ms: Date.now() - t0
+          });
+          call(method, nextUrl, postData, headers, network, success, error, timeoutMs, hops + 1);
+          return;
+        }
         error(xhr || {}, status);
       }, postData || false, params);
     }
 
     function deviceCode(network, success, error) {
       Logger.info('auth', 'POST /oauth2/device grant=device_code');
-      call('POST', API_HOST + '/oauth2/device',
+      call('POST', API_BASE() + '/oauth2/device',
         commonForm('grant_type=device_code'),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -353,8 +389,9 @@
           // Lampa.Reguest may already parse JSON; tolerate both
           if (typeof json === 'string') { try { json = JSON.parse(json); } catch (e) {} }
           if (json && json.code) {
+            if (json.verification_uri) DEVICE_PAGE = String(json.verification_uri);
             Logger.info('auth', 'device code received', {
-              user_code: json.user_code, expires_in: json.expires_in, interval: json.interval
+              user_code: json.user_code, expires_in: json.expires_in, interval: json.interval, uri: json.verification_uri
             });
             success(json);
           } else {
@@ -371,7 +408,7 @@
     }
 
     function pollDeviceToken(network, code, success, pending, error) {
-      call('POST', API_HOST + '/oauth2/device',
+      call('POST', API_BASE() + '/oauth2/device',
         commonForm('grant_type=device_token&code=' + encodeURIComponent(code)),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -410,7 +447,7 @@
         return;
       }
       Logger.info('auth', 'POST /oauth2/token refresh');
-      call('POST', API_HOST + '/oauth2/token',
+      call('POST', API_BASE() + '/oauth2/token',
         commonForm('grant_type=refresh_token&refresh_token=' + encodeURIComponent(rt)),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -449,7 +486,7 @@
         }
         if (parts.length) qs = '?' + parts.join('&');
       }
-      var url = API_HOST + '/v1' + path + qs;
+      var url = API_BASE() + '/v1' + path + qs;
       var t = tokenAccess();
       if (!t) {
         Logger.warn('api', 'no token', { path: path });
@@ -490,7 +527,7 @@
      * Used for settings updates. Body is x-www-form-urlencoded.
      */
     function apiPost(network, path, body, success, error, _retried) {
-      var url = API_HOST + '/v1' + path;
+      var url = API_BASE() + '/v1' + path;
       var t = tokenAccess();
       if (!t) {
         Logger.warn('api', 'no token', { path: path });
@@ -577,6 +614,11 @@
   /* ============================================================ *
    *  HELPERS                                                     *
    * ============================================================ */
+
+  function isNetworkFailureExt(xhr, status) {
+    var code = xhr && xhr.status;
+    return !code || status === 'timeout' || status === 'error';
+  }
 
   /**
    * Build device identification fields for kinopub /v1/device/notify.
@@ -2117,6 +2159,7 @@
       player:   detectActualPlayer() || '(default)',
       hlsMethod: (function () { try { return Lampa.Storage.field('player_hls_method'); } catch (e) { return '?'; } })(),
       proxy:    (kpProxyAvailable === true ? 'up' : kpProxyAvailable === false ? 'down' : 'unknown') + (kpProxyVersion ? ' v' + kpProxyVersion : ''),
+      apiHost:  API_BASE(),
       setting:  kpSubsMode(),
       mode:     kpSubsModeResolved(),
       title:    (data && data.title) || '',
@@ -2140,7 +2183,7 @@
     if (!d) return Lampa.Lang.translate('kp_diag_empty');
     var L = [];
     L.push('kp.js ' + d.plugin + ' / Lampa ' + d.lampa + ' / ' + d.platform + (d.tizen ? ' Tizen ' + d.tizen : '') + (d.chrome ? ' Chrome ' + d.chrome : ''));
-    L.push('player=' + d.player + ' hls_method=' + d.hlsMethod + ' proxy=' + d.proxy);
+    L.push('player=' + d.player + ' hls_method=' + d.hlsMethod + ' proxy=' + d.proxy + ' api=' + d.apiHost);
     L.push('subs setting=' + d.setting + ' → mode=' + d.mode);
     L.push('title: ' + d.title);
     L.push('play url: ' + d.playUrl);
@@ -3050,7 +3093,7 @@
             'style="text-align:center; margin-top: 1em; background-color: #333; color: #fff; padding: 0.6em 1em; font-size: 1.4em; letter-spacing: 0.2em;">' +
           Lampa.Lang.translate('kp_auth_wait') + '...' +
         '</div>' +
-        '<div style="margin-top:1em; opacity:.7; text-align:center;">' +
+        '<div class="kp-auth-url" style="margin-top:1em; opacity:.7; text-align:center;">' +
           Lampa.Lang.translate('kp_auth_url') +
         '</div>' +
         '<br>' +
@@ -3095,6 +3138,9 @@
       user_code = json.user_code;
       var interval = (json.interval || 5) * 1000;
       modal.find('.selector').text(user_code);
+      // v1.0.79: kinopub moved its site (kino.pub → kino.watch); show the
+      // verification_uri the API itself returned.
+      try { modal.find('.kp-auth-url').text(DEVICE_PAGE); } catch (e) {}
 
       showModal();
 
@@ -3256,7 +3302,11 @@
           component.doesNotAnswer();
         }
       }, function (xhr, status) {
-        Logger.error('source', 'search error', { http: xhr && xhr.status, status: status });
+        Logger.error('source', 'search error', { http: xhr && xhr.status, status: status, host: API_BASE() });
+        try {
+          if (isNetworkFailureExt(xhr, status)) Lampa.Noty.show(Lampa.Lang.translate('kp_api_unreachable'));
+          else if (xhr && xhr.status) Lampa.Noty.show('KinoPub API: HTTP ' + xhr.status);
+        } catch (e) {}
         component.doesNotAnswer();
       });
     };
@@ -3279,7 +3329,11 @@
           component.doesNotAnswer();
         }
       }, function (xhr, status) {
-        Logger.error('source', 'find error', { http: xhr && xhr.status, status: status });
+        Logger.error('source', 'find error', { http: xhr && xhr.status, status: status, host: API_BASE() });
+        try {
+          if (isNetworkFailureExt(xhr, status)) Lampa.Noty.show(Lampa.Lang.translate('kp_api_unreachable'));
+          else if (xhr && xhr.status) Lampa.Noty.show('KinoPub API: HTTP ' + xhr.status);
+        } catch (e) {}
         component.doesNotAnswer();
       });
     };
@@ -5117,14 +5171,14 @@
         ua: 'Авторизація kinopub'
       },
       kp_auth_text: {
-        ru: 'Откройте на телефоне или ПК страницу kino.pub/device и введите код:',
-        en: 'Open kino.pub/device on your phone or PC and enter the code:',
-        ua: 'Відкрийте на телефоні чи ПК сторінку kino.pub/device та введіть код:'
+        ru: 'Откройте на телефоне или ПК страницу устройств kinopub (адрес ниже) и введите код:',
+        en: 'Open the kinopub device page (address below) on your phone or PC and enter the code:',
+        ua: 'Відкрийте на телефоні чи ПК сторінку пристроїв kinopub (адреса нижче) та введіть код:'
       },
       kp_auth_url: {
-        ru: 'https://kino.pub/device',
-        en: 'https://kino.pub/device',
-        ua: 'https://kino.pub/device'
+        ru: 'https://kino.watch/device',
+        en: 'https://kino.watch/device',
+        ua: 'https://kino.watch/device'
       },
       kp_auth_wait: {
         ru: 'Получаем код',
@@ -5292,6 +5346,11 @@
         en: 'Subtitles: load error',
         ua: 'Субтитри: помилка завантаження'
       },
+      kp_api_unreachable: {
+        ru: 'KinoPub: API не отвечает (таймаут). Похоже на блокировку провайдером — проверьте VPN/DPI-обход на роутере.',
+        en: 'KinoPub: API not responding (timeout). Looks like an ISP block — check VPN/DPI bypass on the router.',
+        ua: 'KinoPub: API не відповідає (таймаут). Схоже на блокування провайдером — перевірте VPN/DPI-обхід.'
+      },
       kp_set_logout: {
         ru: 'Выйти из аккаунта',
         en: 'Logout',
@@ -5400,8 +5459,9 @@
           kpUserId = String(j.user.username).toLowerCase().replace(/[^a-z0-9_.\-]/g, '');
           Logger.info('voicesync', 'user namespace ready', { userId: kpUserId });
         }
-      }, function () {
-        Logger.warn('auth', 'profile check failed');
+      }, function (xhr, status) {
+        Logger.warn('auth', 'profile check failed', { http: xhr && xhr.status, status: status, host: API_BASE() });
+        try { if (isNetworkFailureExt(xhr, status)) Lampa.Noty.show(Lampa.Lang.translate('kp_api_unreachable')); } catch (e) {}
       });
       // Refresh device identity on every startup — kinoapi.com docs recommend
       // this so kinopub UI keeps device record up-to-date with current OS/build.
