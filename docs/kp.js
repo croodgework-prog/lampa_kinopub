@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.79';
+  var PLUGIN_VERSION  = '1.0.80';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -92,6 +92,9 @@
   // status 0) the plugin hops to the next host and sticks with it.
   var KP_API_HOSTS    = ['https://api.service-kp.com', 'https://api.srvkp.com'];
   var kpApiHostIdx    = 0;
+  // v1.0.80: true while API calls go through the relay (see KP.proxify).
+  var kpUseRelay      = false;
+  var KP_RELAY_STICKY_MS = 6 * 60 * 60 * 1000;
   function API_BASE() { return KP_API_HOSTS[kpApiHostIdx]; }
   var API_HOST        = KP_API_HOSTS[0]; // legacy name, still used for logging
   var DEVICE_PAGE     = 'https://kino.watch/device'; // overwritten by verification_uri from /oauth2/device
@@ -313,10 +316,19 @@
       Lampa.Storage.set(KEY_REFRESH, '');
     }
 
+    // v1.0.80: KEY_PROXY holds the address of the API relay (relay/README.md —
+    // a Cloudflare Worker, reachable from RU when kinopub hosts are not).
+    // Format: <relay>/<full target url>. Used only while kpUseRelay is on:
+    // after a direct network failure in call(), or at boot when the last
+    // session had to switch (kp_relay_sticky, 6 h) — then a background
+    // direct probe returns us to the direct host as soon as it works again.
+    function relayBase() {
+      return (Lampa.Storage.get(KEY_PROXY, '') || '').replace(/\/+$/, '');
+    }
+
     function proxify(url) {
-      var p = (Lampa.Storage.get(KEY_PROXY, '') || '').replace(/\/+$/, '');
-      if (!p) return url;
-      // append URL — most CORS-proxies accept this format (cors.byskaz.ru/<full_url>)
+      var p = relayBase();
+      if (!p || !kpUseRelay) return url;
       return p + '/' + url;
     }
 
@@ -346,7 +358,7 @@
       return !code || status === 'timeout' || status === 'error';
     }
 
-    function call(method, url, postData, headers, network, success, error, timeoutMs, _hops) {
+    function call(method, url, postData, headers, network, success, error, timeoutMs, _hops, _viaRelay) {
       var net = network || new Lampa.Reguest();
       net.timeout(timeoutMs || 15000);
 
@@ -357,6 +369,7 @@
 
       var fullUrl = proxify(url);
       var hops = _hops || 0;
+      var viaRelay = !!(_viaRelay || (kpUseRelay && relayBase()));
       var t0 = Date.now();
 
       // .silent(url, complite, error, post_data?, params?) — params.headers supported.
@@ -364,6 +377,26 @@
         success(json);
       }, function (xhr, status) {
         var hostIdx = apiHostOf(url);
+        if (hostIdx >= 0 && isNetworkFailure(xhr, status) && viaRelay) {
+          // The relay itself is unreachable — drop back to direct for now so
+          // we don't keep hammering a dead relay; sticky flag cleared.
+          kpUseRelay = false;
+          try { Lampa.Storage.set('kp_relay_sticky', 0); } catch (e) {}
+          Logger.warn('api', 'relay unreachable, back to direct', { relay: relayBase(), status: status, ms: Date.now() - t0 });
+          error(xhr || {}, status);
+          return;
+        }
+        if (hostIdx >= 0 && isNetworkFailure(xhr, status) && relayBase() && !kpUseRelay) {
+          // v1.0.80: direct host blocked (RU ISP) — switch to the relay and
+          // retry the same request; stay on the relay for this session.
+          kpUseRelay = true;
+          try { Lampa.Storage.set('kp_relay_sticky', Date.now()); } catch (e) {}
+          Logger.warn('api', 'host unreachable, switching to relay', {
+            host: KP_API_HOSTS[hostIdx], relay: relayBase(), status: status, ms: Date.now() - t0
+          });
+          call(method, url, postData, headers, network, success, error, timeoutMs, hops, true);
+          return;
+        }
         if (hostIdx >= 0 && isNetworkFailure(xhr, status) && hops < KP_API_HOSTS.length - 1) {
           // v1.0.79: hop to the next API host and retry the same request once.
           var nextIdx = (hostIdx + 1) % KP_API_HOSTS.length;
@@ -597,6 +630,22 @@
       },
       saveDeviceSettings: function (network, deviceId, settings, ok, err) {
         apiPost(network, '/device/' + deviceId + '/settings', settings, ok, err);
+      },
+      relayBase: relayBase,
+      // v1.0.80: raw direct probe (bypasses relay + host hop). cb(reachable, ms, status)
+      probeDirect: function (timeoutMs, cb) {
+        var t0 = Date.now();
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', KP_API_HOSTS[0] + '/v1/user', true);
+          xhr.timeout = timeoutMs || 8000;
+          var tk = tokenAccess();
+          if (tk) xhr.setRequestHeader('Authorization', 'Bearer ' + tk);
+          xhr.onload    = function () { cb(true, Date.now() - t0, xhr.status); };
+          xhr.onerror   = function () { cb(xhr.status > 0, Date.now() - t0, xhr.status); };
+          xhr.ontimeout = function () { cb(false, Date.now() - t0, 0); };
+          xhr.send();
+        } catch (e) { cb(false, Date.now() - t0, 0); }
       },
       // v1.0.74: diagnostics only — /v1/items/media-links?mid= returns the
       // per-media file + subtitles[] list (Lampac uses it as a fallback).
@@ -2159,7 +2208,7 @@
       player:   detectActualPlayer() || '(default)',
       hlsMethod: (function () { try { return Lampa.Storage.field('player_hls_method'); } catch (e) { return '?'; } })(),
       proxy:    (kpProxyAvailable === true ? 'up' : kpProxyAvailable === false ? 'down' : 'unknown') + (kpProxyVersion ? ' v' + kpProxyVersion : ''),
-      apiHost:  API_BASE(),
+      apiHost:  (kpUseRelay && KP.relayBase()) ? 'relay ' + KP.relayBase().replace(/\/[^\/]*$/, '/…') : API_BASE(),
       setting:  kpSubsMode(),
       mode:     kpSubsModeResolved(),
       title:    (data && data.title) || '',
@@ -5241,12 +5290,12 @@
         ua: 'Авто (за плеєром)'
       },
       kp_set_proxy: {
-        ru: 'CORS-прокси',
-        en: 'CORS proxy',
-        ua: 'CORS-проксі'
+        ru: 'Резервный relay API',
+        en: 'Backup API relay',
+        ua: 'Резервний relay API'
       },
       kp_set_proxy_descr: {
-        ru: 'Опционально. Если api kinopub режут CORS - укажите http(s)-прокси, на который добавится URL запроса. Оставьте пустым на Tizen.',
+        ru: 'Адрес вашего Cloudflare Worker из relay/README.md вместе с секретом, без слеша в конце. Используется только когда провайдер блокирует API kinopub (таймаут): плагин сам переключится на relay и вернётся на прямой доступ, когда он заработает.',
         en: 'Optional. Address of CORS proxy if needed. Leave empty on Tizen.',
         ua: 'Не обовязково. Адреса CORS-проксі якщо потрібно.'
       },
@@ -5448,6 +5497,32 @@
         Logger.error('button', 'mount failed', String(err));
       }
     });
+
+    // v1.0.80: relay bootstrap. If the previous session had to switch to the
+    // relay (sticky < 6 h), start on it right away (no 20 s timeout on the
+    // first call) and probe the direct host in the background; the moment
+    // direct works again we return to it.
+    try {
+      var relayCfg = KP.relayBase();
+      if (relayCfg) {
+        var sticky = parseInt(Lampa.Storage.get('kp_relay_sticky', '0'), 10) || 0;
+        kpUseRelay = (Date.now() - sticky) < KP_RELAY_STICKY_MS;
+        Logger.info('api', 'relay configured', { relay: relayCfg, startOnRelay: kpUseRelay });
+        kpFetchText(relayCfg + '/health', 8000, function (err, body, status) {
+          Logger.info('api', 'relay health', { err: err, status: status, body: String(body || '').slice(0, 120) });
+        });
+        if (kpUseRelay) {
+          KP.probeDirect(8000, function (reachable, ms, st) {
+            Logger.info('api', 'direct probe', { reachable: reachable, ms: ms, status: st });
+            if (reachable) {
+              kpUseRelay = false;
+              Lampa.Storage.set('kp_relay_sticky', 0);
+              Logger.info('api', 'direct host reachable again, leaving relay');
+            }
+          });
+        }
+      }
+    } catch (e) { Logger.warn('api', 'relay bootstrap failed', String(e)); }
 
     // Background token health check
     if (KP.hasToken()) {
