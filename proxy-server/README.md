@@ -27,6 +27,14 @@ GET /manifest-proxy?master=<...>&voice=<N>&subs=1        (v1.2.0+)
     добавляется SUBTITLES="sub". Нужен для режима субтитров
     «Через плеер ТВ» в kp.js: Tizen AVPlay сам показывает их как TEXT-дорожки.
     Без параметра вывод байт-в-байт как в v1.1.6.
+
+GET|POST /api-relay/<https://api.service-kp.com/v1/...>           (v1.3.0+)
+  → ответ API kinopub как есть (+CORS). Пересылаются Authorization,
+    Content-Type, Accept. Цели только api.service-kp.com / api.srvkp.com /
+    kpapp.link. Нужен, когда провайдер в РФ блокирует API kinopub:
+    в kp.js → Настройки → KinoPub → «Резервный relay API» вписать
+    https://kinopub.fastcdn.pics/api-relay
+GET /api-relay/health → { ok: true }
 ```
 
 ## Безопасность

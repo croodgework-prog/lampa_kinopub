@@ -21,9 +21,17 @@
  * so Tizen AVPlay lists them as TEXT tracks. Without the flag the
  * output is byte-identical to v1.1.6 (subtitles dropped).
  *
+ * v1.3.0: `/api-relay/<full kinopub API url>` — relays kp.js API calls
+ * (GET/POST, Authorization forwarded) when RU ISPs block the kinopub API
+ * hosts by DNS/SNI/IP. Only api.service-kp.com / api.srvkp.com /
+ * kpapp.link are accepted as targets. kp.js uses it as a fallback via the
+ * «Резервный relay API» setting (value: https://<this host>/api-relay).
+ *
  * Endpoints:
  *   GET /manifest-proxy?master=<encoded-kinopub-url>&voice=<1..12>[&subs=1]
  *                       → application/vnd.apple.mpegurl reduced master
+ *   GET|POST /api-relay/<https://api.service-kp.com/...>  → upstream response (+CORS)
+ *   GET /api-relay/health → { ok: true }
  *   GET /health         → { ok: true, version, uptime, cache, hits }
  *
  * Whitelist: only hosts ending in cdn2cdn.com / digital-cdn.net /
@@ -44,7 +52,7 @@ const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS || '60000', 10);
 const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS || '10000', 10);
 const VOICE_SYNC_DIR = process.env.VOICE_SYNC_DIR || '/var/data/voice-sync';
 const VOICE_SYNC_MAX_BYTES = parseInt(process.env.VOICE_SYNC_MAX_BYTES || '65536', 10);
-const VERSION  = '1.2.0';
+const VERSION  = '1.3.0';
 const STARTED  = Date.now();
 
 try { fs.mkdirSync(VOICE_SYNC_DIR, { recursive: true }); } catch (e) {
@@ -563,6 +571,58 @@ function handleVoiceSync(req, res, userIdRaw, showIdRaw) {
 }
 
 /* ──────────────────────────────────────────────────────────────────── *
+ *  v1.3.0 — API relay (kinopub API hosts only)                          *
+ * ──────────────────────────────────────────────────────────────────── */
+
+const RELAY_HOSTS = ['api.service-kp.com', 'api.srvkp.com', 'kpapp.link'];
+
+function handleApiRelay(req, res, rawPath) {
+  // rawPath = everything after "/api-relay/" incl. the original query string
+  let target = rawPath.replace(/^\/+/, '');
+  if (target === '' || target === 'health') {
+    return sendJson(res, 200, { ok: true, service: 'kp-api-relay', version: VERSION, hosts: RELAY_HOSTS });
+  }
+  target = target.replace(/^(https?:)\/(?!\/)/, '$1//'); // tolerate collapsed "https:/"
+  let t;
+  try { t = new URL(target); } catch (e) {
+    logLine(req, 400, 'relay bad target');
+    return sendJson(res, 400, { ok: false, error: 'bad target url' });
+  }
+  if (t.protocol !== 'https:' || !RELAY_HOSTS.includes(t.hostname)) {
+    logLine(req, 403, 'relay host=' + t.hostname);
+    return sendJson(res, 403, { ok: false, error: 'host not allowed' });
+  }
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+  }
+  const headers = { 'User-Agent': 'lampa-kinopub-proxy/' + VERSION + ' (+relay)', 'Accept': req.headers['accept'] || '*/*' };
+  if (req.headers['authorization']) headers['Authorization'] = req.headers['authorization'];
+  if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
+  if (req.headers['accept-language']) headers['Accept-Language'] = req.headers['accept-language'];
+
+  const t0 = Date.now();
+  const up = https.request(t, { method: req.method, headers, timeout: FETCH_TIMEOUT_MS }, upRes => {
+    const outHeaders = {
+      'Content-Type': upRes.headers['content-type'] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'X-Relay-Target': t.hostname
+    };
+    res.writeHead(upRes.statusCode || 502, outHeaders);
+    upRes.pipe(res);
+    upRes.on('end', () => logLine(req, upRes.statusCode || 0, 'relay ' + t.hostname + t.pathname + ' ' + (Date.now() - t0) + 'ms'));
+  });
+  up.on('timeout', () => up.destroy(new Error('upstream timeout')));
+  up.on('error', e => {
+    logLine(req, 502, 'relay upstream: ' + (e.message || e));
+    if (!res.headersSent) sendJson(res, 502, { ok: false, error: String(e.message || e) });
+    else res.end();
+  });
+  if (req.method === 'POST') req.pipe(up); else up.end();
+}
+
+/* ──────────────────────────────────────────────────────────────────── *
  *  Server                                                               *
  * ──────────────────────────────────────────────────────────────────── */
 
@@ -579,6 +639,10 @@ const server = http.createServer((req, res) => {
 
   const reqPath = req.url.split('?')[0];
 
+  if (reqPath === '/api-relay' || reqPath.indexOf('/api-relay/') === 0) {
+    return handleApiRelay(req, res, req.url.substring('/api-relay'.length));
+  }
+
   if (reqPath === '/health'         && req.method === 'GET') return handleHealth(req, res);
   if (reqPath === '/manifest-proxy' && req.method === 'GET') return handleManifestProxy(req, res);
 
@@ -594,6 +658,7 @@ server.listen(PORT, HOST, () => {
   process.stdout.write(`lampa-kinopub-proxy v${VERSION} listening on ${HOST}:${PORT}\n`);
   process.stdout.write(`  GET    /health\n`);
   process.stdout.write(`  GET    /manifest-proxy?master=<encoded-url>&voice=<N>\n`);
+  process.stdout.write(`  GET|POST /api-relay/<https://api.service-kp.com/...>  (kinopub API relay)\n`);
   process.stdout.write(`  GET    /voice-sync/<user>           — list all shows\n`);
   process.stdout.write(`  GET    /voice-sync/<user>/<show>    — one snapshot\n`);
   process.stdout.write(`  PUT    /voice-sync/<user>/<show>    — store snapshot\n`);
