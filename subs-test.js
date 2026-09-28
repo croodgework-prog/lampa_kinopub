@@ -32,7 +32,16 @@ global.document  = { addEventListener: noop, querySelector: () => null };
 Object.defineProperty(global, 'navigator', { value: { userAgent: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 9.0) AppleWebKit/537.36 Chrome/120.0.6099.5 TV Safari/537.36' }, configurable: true });
 global.$ = () => chain();
 global.XMLHttpRequest = function () { this.open = noop; this.send = noop; this.setRequestHeader = noop; };
-function Reguest() { this.timeout = noop; this.silent = noop; this.clear = noop; this.native = noop; }
+const netLog = [];
+let netPlan = () => ({ ok: true, json: {} });
+function Reguest() {
+  this.timeout = noop; this.clear = noop; this.native = noop;
+  this.silent = function (url, ok, err, post) {
+    netLog.push(url);
+    const r = netPlan(url, post);
+    if (r.ok) ok(r.json); else err(r.xhr || { status: 0 }, r.status || 'timeout');
+  };
+}
 global.Lampa = {
   Manifest: { app_digital: 333, app_version: '3.3.3', plugins: null },
   Storage:  { get: (k, d) => (k in storage ? storage[k] : d), set: (k, v) => { storage[k] = v; }, field: (k) => storage[k], cache: (k, n, d) => d, sync: noop },
@@ -57,7 +66,7 @@ let src = fs.readFileSync(path.join(__dirname, 'docs', 'kp.js'), 'utf8');
 const tail = '  startPlugin();\n\n})();';
 assert(src.endsWith(tail + '\n') || src.endsWith(tail), 'kp.js tail changed — update subs-test.js');
 src = src.replace(tail,
-  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpSubLabels, kpMediaLinksToList, kpSortSubs, kpBuildSubItems, kpSubsModeResolved, kpPickSecond, kpSecondLang };\n})();');
+  '  startPlugin();\n  window.__kpTest = { kpResolveUrl, parseHls4Master, kpExtractHlsSubs, KpSubs, kpSubLabel, kpSubLabels, kpMediaLinksToList, kpSortSubs, kpBuildSubItems, kpSubsModeResolved, kpPickSecond, kpSecondLang, KP, kpApplyApiMirror, getHosts: function () { return { api: KP_API_HOSTS, oauth: KP_DEFAULT_HOSTS, apiIdx: kpApiHostIdx }; } };\n})();');
 new Function(src)();
 const T = global.__kpTest;
 assert(T, 'plugin did not boot (early return?)');
@@ -181,6 +190,34 @@ T.KpSubs.clearSecond(); T.KpSubs.update(2);
 ok(T.KpSubs.compose() === 'Привет', 'plain text when no second track');
 T.KpSubs.deselect();
 ok(T.KpSubs.active() === null && T.KpSubs.secondActive() === null, 'deselect clears both');
+
+// ── 7d. personal mirror + oauth host split + token-preserving refresh ────
+storage.kp_token = 'tok'; storage.kp_refresh = 'ref';
+ok(T.kpApplyApiMirror('grez.example.ovh/') === 'https://grez.example.ovh', 'mirror normalized');
+ok(T.getHosts().api.join(',') === 'https://grez.example.ovh,https://api.service-kp.com,https://api.srvkp.com', 'mirror first in /v1 list');
+// /v1 via mirror succeeds on first try
+netLog.length = 0; netPlan = () => ({ ok: true, json: { items: [] } });
+let got = null; T.KP.search(new Reguest(), 'x', 'movie', j => { got = j; }, () => {});
+ok(got && netLog.length === 1 && netLog[0].indexOf('https://grez.example.ovh/v1/items/search') === 0, '/v1 goes to mirror: ' + netLog[0]);
+// mirror down → hop to api.service-kp.com
+netLog.length = 0; netPlan = (u) => (u.indexOf('grez') >= 0 ? { ok: false } : { ok: true, json: { items: [1] } });
+got = null; T.KP.search(new Reguest(), 'x', 'movie', j => { got = j; }, () => {});
+ok(got && netLog.length === 2 && netLog[1].indexOf('https://api.service-kp.com/v1/') === 0, 'mirror timeout → default host: ' + netLog.join(' | '));
+T.kpApplyApiMirror('grez.example.ovh');
+// oauth2 never touches the mirror; network-failed refresh keeps tokens
+netLog.length = 0;
+netPlan = (u) => (u.indexOf('/oauth2/') >= 0 ? { ok: false } : (u.indexOf('/v1/user') >= 0 ? { ok: false, xhr: { status: 401 }, status: 'error' } : { ok: true, json: {} }));
+let errd = false; T.KP.profile(new Reguest(), () => {}, () => { errd = true; });
+const oauthCalls = netLog.filter(u => u.indexOf('/oauth2/') >= 0);
+ok(errd && oauthCalls.length === 2 && oauthCalls.every(u => u.indexOf('grez') < 0), 'oauth2 only on default hosts: ' + oauthCalls.join(' | '));
+ok(storage.kp_token === 'tok' && storage.kp_refresh === 'ref', 'network-failed refresh keeps tokens');
+// real rejection (400) clears
+netLog.length = 0;
+netPlan = (u) => (u.indexOf('/oauth2/') >= 0 ? { ok: false, xhr: { status: 400 }, status: 'error' } : { ok: false, xhr: { status: 401 }, status: 'error' });
+T.KP.profile(new Reguest(), () => {}, () => {});
+ok(storage.kp_token === '' && storage.kp_refresh === '', 'rejected refresh clears tokens');
+T.kpApplyApiMirror('');
+ok(T.getHosts().api.join(',') === 'https://api.service-kp.com,https://api.srvkp.com', 'empty mirror → defaults');
 
 // ── 8. Proxy: subs pass-through ───────────────────────────────────────────
 let psrc = fs.readFileSync(path.join(__dirname, 'proxy-server', 'server.js'), 'utf8');

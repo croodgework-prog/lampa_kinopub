@@ -21,6 +21,11 @@
  *                            vnd.apple.mpegurl. Required to bypass Tizen
  *                            AVPlayer's multi-audio crash on 4K + 12 voices.
  *                            Query: ?master=<encoded URL>&voice=<1..12>
+ *   GET|POST /api-relay/<https://api.service-kp.com/...>
+ *                          — relays kinopub API calls through THIS machine's
+ *                            internet (e.g. a Mac with VPN) when the ISP blocks
+ *                            the API for the TV. kp.js: «Резервный relay API» =
+ *                            http://<ip-пк>:8088/api-relay . LAN use only.
  */
 
 'use strict';
@@ -294,8 +299,56 @@ async function handleManifestProxy(req, res) {
   }
 }
 
+const RELAY_HOSTS = ['api.service-kp.com', 'api.srvkp.com', 'kpapp.link'];
+
+function handleApiRelay(req, res, rest) {
+  let target = rest.replace(/^\/+/, '');
+  if (target === '' || target === 'health') {
+    return send(res, 200, { ok: true, service: 'kp-api-relay (local)', hosts: RELAY_HOSTS });
+  }
+  target = target.replace(/^(https?:)\/(?!\/)/, '$1//');
+  let t;
+  try { t = new URL(target); } catch (e) { return send(res, 400, { ok: false, error: 'bad target url' }); }
+  if (t.protocol !== 'https:' || !RELAY_HOSTS.includes(t.hostname)) {
+    return send(res, 403, { ok: false, error: 'host not allowed' });
+  }
+  const headers = { 'User-Agent': 'kp-log-server-relay', 'Accept': req.headers['accept'] || '*/*' };
+  if (req.headers['authorization']) headers['Authorization'] = req.headers['authorization'];
+  if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
+  const t0 = Date.now();
+  const up = https.request(t, { method: req.method, headers, timeout: 15000 }, upRes => {
+    res.writeHead(upRes.statusCode || 502, {
+      'Content-Type': upRes.headers['content-type'] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+    });
+    upRes.pipe(res);
+    upRes.on('end', () => process.stdout.write(`[api-relay] ${req.method} ${t.hostname}${t.pathname} → ${upRes.statusCode} ${Date.now() - t0}ms\n`));
+  });
+  up.on('timeout', () => up.destroy(new Error('upstream timeout')));
+  up.on('error', e => {
+    process.stdout.write(`[api-relay] error ${t.hostname}${t.pathname}: ${e.message || e}\n`);
+    if (!res.headersSent) send(res, 502, { ok: false, error: String(e.message || e) }); else res.end();
+  });
+  if (req.method === 'POST') req.pipe(up); else up.end();
+}
+
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return send(res, 204, '');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+    });
+    return res.end();
+  }
+
+  // API relay is checked before LOG_TOKEN: kp.js API calls carry no X-Log-Token.
+  if (req.url === '/api-relay' || req.url.indexOf('/api-relay/') === 0) {
+    return handleApiRelay(req, res, req.url.substring('/api-relay'.length));
+  }
 
   if (LOG_TOKEN) {
     const hdr = req.headers['x-log-token'];
@@ -334,6 +387,7 @@ server.listen(PORT, () => {
   process.stdout.write(`  POST /logs             batch\n`);
   process.stdout.write(`  GET  /tail             last 100 records\n`);
   process.stdout.write(`  GET  /manifest-proxy   ?master=<url>&voice=<N>\n`);
+  process.stdout.write(`  GET|POST /api-relay/<https://api.service-kp.com/...>  kinopub API relay\n`);
   process.stdout.write(`  GET  /health\n`);
   if (LOG_TOKEN) process.stdout.write(`  AUTH: X-Log-Token header required\n`);
 });

@@ -23,7 +23,7 @@
    *  CONSTANTS                                                   *
    * ============================================================ */
 
-  var PLUGIN_VERSION  = '1.0.80';
+  var PLUGIN_VERSION  = '1.0.81';
   // Public manifest-proxy URL — set near KP_PROXY_URL declaration below.
   var COMPONENT_NAME  = 'online_kp';
   var BALANSER        = 'kpapi';
@@ -90,8 +90,27 @@
   // list: api.srvkp.com "стандартный", api.service-kp.com "старый"). RU ISPs
   // block them by SNI/IP unevenly, so on a network-level failure (timeout,
   // status 0) the plugin hops to the next host and sticks with it.
-  var KP_API_HOSTS    = ['https://api.service-kp.com', 'https://api.srvkp.com'];
+  var KP_DEFAULT_HOSTS = ['https://api.service-kp.com', 'https://api.srvkp.com'];
+  // v1.0.81: personal kinopub mirror (setting kp_api_mirror, e.g. the domain
+  // kinopub issues per account). It serves the /v1 API (+CORS) and is not on
+  // RU block lists, but has no /oauth2 — token calls stay on default hosts.
+  var KP_API_HOSTS    = KP_DEFAULT_HOSTS.slice(0);
   var kpApiHostIdx    = 0;
+  var kpOauthHostIdx  = 0;
+  function OAUTH_BASE() { return KP_DEFAULT_HOSTS[kpOauthHostIdx]; }
+  function kpNormalizeHost(v) {
+    v = String(v || '').replace(/^\s+|\s+$/g, '').replace(/\/+$/, '');
+    if (!v) return '';
+    if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+    var m = v.match(/^(https?:\/\/[^\/?#]+)/i);
+    return m ? m[1].toLowerCase() : '';
+  }
+  function kpApplyApiMirror(raw) {
+    var mirror = kpNormalizeHost(raw);
+    KP_API_HOSTS = (mirror && KP_DEFAULT_HOSTS.indexOf(mirror) < 0 ? [mirror] : []).concat(KP_DEFAULT_HOSTS);
+    kpApiHostIdx = 0;
+    return mirror;
+  }
   // v1.0.80: true while API calls go through the relay (see KP.proxify).
   var kpUseRelay      = false;
   var KP_RELAY_STICKY_MS = 6 * 60 * 60 * 1000;
@@ -116,6 +135,7 @@
   //            (Tizen AVPlay) lists them itself; needs manifest-proxy >= 1.2.0
   //   api    → legacy: only kinopub API subtitles[] (.srt/.vtt) as play.subtitles
   //   off    → no subtitles at all
+  var KEY_API_MIRROR  = 'kp_api_mirror';   // v1.0.81: personal kinopub mirror host
   var KEY_SUBS_MODE   = 'kp_subs_mode';
   var KEY_DIAG        = 'kp_diag';
   // v1.0.78: dual subtitles — second (learning) language and its position
@@ -316,6 +336,20 @@
       Lampa.Storage.set(KEY_REFRESH, '');
     }
 
+    // v1.0.81: a refresh that failed because /oauth2 is unreachable (RU ISP
+    // block) must NOT log the user out — the device flow would be blocked
+    // too. Only a real rejection by kinopub (HTTP 4xx / empty grant) clears.
+    function clearTokensIfRejected(rxhr, rstatus) {
+      var code = rxhr && rxhr.status;
+      if (rstatus === 'no_refresh_token' || rstatus === 'empty' || (code >= 400 && code < 500)) {
+        Logger.warn('auth', 'refresh rejected, clearing tokens', { http: code, status: rstatus });
+        clearTokens();
+      } else {
+        Logger.warn('auth', 'refresh failed (network), keeping tokens', { http: code, status: rstatus });
+        try { Lampa.Noty.show(Lampa.Lang.translate('kp_refresh_network')); } catch (e) {}
+      }
+    }
+
     // v1.0.80: KEY_PROXY holds the address of the API relay (relay/README.md —
     // a Cloudflare Worker, reachable from RU when kinopub hosts are not).
     // Format: <relay>/<full target url>. Used only while kpUseRelay is on:
@@ -344,9 +378,15 @@
      * source can cancel pending kinopub requests on destroy/back. Falls back to
      * a temporary network when none provided (e.g. background profile check).
      */
-    function apiHostOf(url) {
-      for (var i = 0; i < KP_API_HOSTS.length; i++) {
-        if (String(url || '').indexOf(KP_API_HOSTS[i] + '/') === 0) return i;
+    // /oauth2/* only exists on the default hosts; /v1/* on mirror + defaults.
+    function hostListFor(url) {
+      return /\/oauth2\//.test(String(url || '')) ? KP_DEFAULT_HOSTS : KP_API_HOSTS;
+    }
+
+    function apiHostOf(url, list) {
+      list = list || hostListFor(url);
+      for (var i = 0; i < list.length; i++) {
+        if (String(url || '').indexOf(list[i] + '/') === 0) return i;
       }
       return -1;
     }
@@ -376,7 +416,8 @@
       net.silent(fullUrl, function (json) {
         success(json);
       }, function (xhr, status) {
-        var hostIdx = apiHostOf(url);
+        var hostList = hostListFor(url);
+        var hostIdx = apiHostOf(url, hostList);
         if (hostIdx >= 0 && isNetworkFailure(xhr, status) && viaRelay) {
           // The relay itself is unreachable — drop back to direct for now so
           // we don't keep hammering a dead relay; sticky flag cleared.
@@ -392,18 +433,18 @@
           kpUseRelay = true;
           try { Lampa.Storage.set('kp_relay_sticky', Date.now()); } catch (e) {}
           Logger.warn('api', 'host unreachable, switching to relay', {
-            host: KP_API_HOSTS[hostIdx], relay: relayBase(), status: status, ms: Date.now() - t0
+            host: hostList[hostIdx], relay: relayBase(), status: status, ms: Date.now() - t0
           });
           call(method, url, postData, headers, network, success, error, timeoutMs, hops, true);
           return;
         }
-        if (hostIdx >= 0 && isNetworkFailure(xhr, status) && hops < KP_API_HOSTS.length - 1) {
+        if (hostIdx >= 0 && isNetworkFailure(xhr, status) && hops < hostList.length - 1) {
           // v1.0.79: hop to the next API host and retry the same request once.
-          var nextIdx = (hostIdx + 1) % KP_API_HOSTS.length;
-          kpApiHostIdx = nextIdx;
-          var nextUrl = KP_API_HOSTS[nextIdx] + url.substring(KP_API_HOSTS[hostIdx].length);
+          var nextIdx = (hostIdx + 1) % hostList.length;
+          if (hostList === KP_API_HOSTS) kpApiHostIdx = nextIdx; else kpOauthHostIdx = nextIdx;
+          var nextUrl = hostList[nextIdx] + url.substring(hostList[hostIdx].length);
           Logger.warn('api', 'host unreachable, switching', {
-            from: KP_API_HOSTS[hostIdx], to: KP_API_HOSTS[nextIdx], status: status, ms: Date.now() - t0
+            from: hostList[hostIdx], to: hostList[nextIdx], status: status, ms: Date.now() - t0
           });
           call(method, nextUrl, postData, headers, network, success, error, timeoutMs, hops + 1);
           return;
@@ -414,7 +455,7 @@
 
     function deviceCode(network, success, error) {
       Logger.info('auth', 'POST /oauth2/device grant=device_code');
-      call('POST', API_BASE() + '/oauth2/device',
+      call('POST', OAUTH_BASE() + '/oauth2/device',
         commonForm('grant_type=device_code'),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -441,7 +482,7 @@
     }
 
     function pollDeviceToken(network, code, success, pending, error) {
-      call('POST', API_BASE() + '/oauth2/device',
+      call('POST', OAUTH_BASE() + '/oauth2/device',
         commonForm('grant_type=device_token&code=' + encodeURIComponent(code)),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -480,7 +521,7 @@
         return;
       }
       Logger.info('auth', 'POST /oauth2/token refresh');
-      call('POST', API_BASE() + '/oauth2/token',
+      call('POST', OAUTH_BASE() + '/oauth2/token',
         commonForm('grant_type=refresh_token&refresh_token=' + encodeURIComponent(rt)),
         { 'Content-Type': 'application/x-www-form-urlencoded' },
         network,
@@ -543,8 +584,8 @@
           if (xhr && xhr.status === 401 && !_retried) {
             refresh(network, function () {
               api(network, path, params, success, error, true);
-            }, function () {
-              clearTokens();
+            }, function (rxhr, rstatus) {
+              clearTokensIfRejected(rxhr, rstatus);
               if (error) error(xhr, status);
             });
           } else {
@@ -590,8 +631,8 @@
           if (xhr && xhr.status === 401 && !_retried) {
             refresh(network, function () {
               apiPost(network, path, body, success, error, true);
-            }, function () {
-              clearTokens();
+            }, function (rxhr, rstatus) {
+              clearTokensIfRejected(rxhr, rstatus);
               if (error) error(xhr, status);
             });
           } else {
@@ -5070,6 +5111,17 @@
 
     Lampa.SettingsApi.addParam({
       component: 'kp',
+      param: { name: KEY_API_MIRROR, type: 'input', values: '', "default": '' },
+      field: { name: Lampa.Lang.translate('kp_set_mirror'), description: Lampa.Lang.translate('kp_set_mirror_descr') },
+      onChange: function (v) {
+        var m = kpApplyApiMirror(v);
+        Logger.info('api', 'mirror changed', { mirror: m, hosts: KP_API_HOSTS });
+        try { Lampa.Noty.show(m ? 'KinoPub API: ' + m : 'KinoPub API: ' + KP_DEFAULT_HOSTS[0]); } catch (e) {}
+      }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'kp',
       param: { name: KEY_PROXY, type: 'input', values: '', "default": '' },
       field: { name: Lampa.Lang.translate('kp_set_proxy'), description: Lampa.Lang.translate('kp_set_proxy_descr') }
     });
@@ -5395,8 +5447,23 @@
         en: 'Subtitles: load error',
         ua: 'Субтитри: помилка завантаження'
       },
+      kp_set_mirror: {
+        ru: 'Зеркало kinopub (ваш домен)',
+        en: 'kinopub mirror (your domain)',
+        ua: 'Дзеркало kinopub (ваш домен)'
+      },
+      kp_set_mirror_descr: {
+        ru: 'Домен, который kinopub выдал вашему аккаунту (например abcd.xyz.ovh). Плагин берёт через него поиск, карточки и субтитры — такие домены обычно не заблокированы. Вход/обновление токена по-прежнему идут через основной API.',
+        en: 'The domain kinopub issued to your account. Search, cards and subtitles go through it (usually not blocked). Sign-in and token refresh still use the main API.',
+        ua: 'Домен, який kinopub видав вашому акаунту. Пошук, картки та субтитри йдуть через нього. Вхід і оновлення токена — через основний API.'
+      },
+      kp_refresh_network: {
+        ru: 'KinoPub: не удалось обновить вход (сеть). Сессия сохранена, повтор позже.',
+        en: 'KinoPub: token refresh failed (network). Session kept, will retry.',
+        ua: 'KinoPub: не вдалося оновити вхід (мережа). Сесію збережено.'
+      },
       kp_api_unreachable: {
-        ru: 'KinoPub: API не отвечает (таймаут). Похоже на блокировку провайдером — проверьте VPN/DPI-обход на роутере.',
+        ru: 'KinoPub: API не отвечает (таймаут), похоже на блокировку провайдером. Впишите ваш домен kinopub в Настройки → KinoPub → «Зеркало kinopub».',
         en: 'KinoPub: API not responding (timeout). Looks like an ISP block — check VPN/DPI bypass on the router.',
         ua: 'KinoPub: API не відповідає (таймаут). Схоже на блокування провайдером — перевірте VPN/DPI-обхід.'
       },
@@ -5497,6 +5564,12 @@
         Logger.error('button', 'mount failed', String(err));
       }
     });
+
+    // v1.0.81: personal mirror goes first in the /v1 host list.
+    try {
+      var mirrorCfg = kpApplyApiMirror(Lampa.Storage.get(KEY_API_MIRROR, ''));
+      Logger.info('api', 'hosts', { mirror: mirrorCfg || null, api: KP_API_HOSTS, oauth: KP_DEFAULT_HOSTS });
+    } catch (e) { Logger.warn('api', 'mirror apply failed', String(e)); }
 
     // v1.0.80: relay bootstrap. If the previous session had to switch to the
     // relay (sticky < 6 h), start on it right away (no 20 s timeout on the
